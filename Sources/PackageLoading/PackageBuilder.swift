@@ -831,23 +831,53 @@ public final class PackageBuilder {
         }
 
         // Create and return the right kind of target depending on what kind of sources we found.
-        if sources.hasSwiftSources {
-            return SwiftTarget(
+        if sources.hasSwiftSources && sources.hasClangSources {
+            // The below module.map is from a mixed language CocoaPods target.
+            // I suspect that we will need to build something similar.
+            //
+            //      framework module MixedPod {
+            //        umbrella header "MixedPod-umbrella.h"
+            //
+            //        export *
+            //        module * { export * }
+            //      }
+            //
+            //      module MixedPod.Swift {
+            //        header "MixedPod-Swift.h"
+            //        requires objc
+            //      }
+
+            // First determine the type of module map that will be appropriate for the target based on its header layout.
+            let moduleMapType: ModuleMapType
+
+            if fileSystem.exists(publicHeadersPath) {
+                let moduleMapGenerator = ModuleMapGenerator(targetName: potentialModule.name, moduleName: potentialModule.name.spm_mangledToC99ExtendedIdentifier(), publicHeadersDir: publicHeadersPath, fileSystem: fileSystem)
+                moduleMapType = moduleMapGenerator.determineModuleMapType(observabilityScope: self.observabilityScope)
+            } else if targetType == .library, manifest.toolsVersion >= .v5_5 {
+                // If this clang target is a library, it must contain "include" directory.
+                throw ModuleError.invalidPublicHeadersDirectory(potentialModule.name)
+            } else {
+                moduleMapType = .none
+            }
+
+            return try MixedTarget(
                 name: potentialModule.name,
                 potentialBundleName: potentialBundleName,
+                cLanguageStandard: manifest.cLanguageStandard,
+                cxxLanguageStandard: manifest.cxxLanguageStandard,
+                includeDir: publicHeadersPath,
+                moduleMapType: moduleMapType,
+                headers: headers,
                 type: targetType,
                 path: potentialModule.path,
                 sources: sources,
                 resources: resources,
                 ignored: ignored,
-                others: others,
                 dependencies: dependencies,
                 swiftVersion: try swiftVersion(),
                 buildSettings: buildSettings
             )
-        } else {
-            // It's not a Swift target, so it's a Clang target (those are the only two types of source target currently supported).
-
+        } else if sources.hasClangSources {
             // First determine the type of module map that will be appropriate for the target based on its header layout.
             let moduleMapType: ModuleMapType
 
@@ -875,6 +905,21 @@ public final class PackageBuilder {
                 resources: resources,
                 ignored: ignored,
                 dependencies: dependencies,
+                buildSettings: buildSettings
+            )
+        } else {
+            // Target has mixed swift sources.
+            return SwiftTarget(
+                name: potentialModule.name,
+                potentialBundleName: potentialBundleName,
+                type: targetType,
+                path: potentialModule.path,
+                sources: sources,
+                resources: resources,
+                ignored: ignored,
+                others: others,
+                dependencies: dependencies,
+                swiftVersion: try swiftVersion(),
                 buildSettings: buildSettings
             )
         }

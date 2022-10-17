@@ -82,6 +82,8 @@ public class LLBuildManifestBuilder {
                         try self.createSwiftCompileCommand(desc)
                     case .clang(let desc):
                         try self.createClangCompileCommand(desc)
+                    case .mixed(let desc):
+                        try self.createMixedCompileCommand(desc)
                 }
             }
         }
@@ -244,7 +246,99 @@ extension LLBuildManifestBuilder {
                                isMainModule: { driver.isExplicitMainModuleJob(job: $0)})
     }
 
+    private func addSwiftCmdsViaIntegratedDriver(
+        _ target: MixedTargetBuildDescription,
+        inputs: [Node],
+        objectNodes: [Node],
+        moduleNode: Node
+    ) throws {
+        // Use the integrated Swift driver to compute the set of frontend
+        // jobs needed to build this Swift target.
+        var commandLine = try target.emitCommandLine();
+        commandLine.append("-driver-use-frontend-path")
+        commandLine.append(buildParameters.toolchain.swiftCompilerPath.pathString)
+        // FIXME: At some point SwiftPM should provide its own executor for
+        // running jobs/launching processes during planning
+        let resolver = try ArgsResolver(fileSystem: target.fileSystem)
+        let executor = SPMSwiftDriverExecutor(resolver: resolver,
+                                              fileSystem: target.fileSystem,
+                                              env: ProcessEnv.vars)
+        var driver = try Driver(args: commandLine,
+                                diagnosticsEngine: self.observabilityScope.makeDiagnosticsEngine(),
+                                fileSystem: self.fileSystem,
+                                executor: executor)
+        let jobs = try driver.planBuild()
+        try addSwiftDriverJobs(for: target, jobs: jobs, inputs: inputs, resolver: resolver,
+                               isMainModule: { driver.isExplicitMainModuleJob(job: $0)})
+    }
+
     private func addSwiftDriverJobs(for targetDescription: SwiftTargetBuildDescription,
+                                    jobs: [Job], inputs: [Node],
+                                    resolver: ArgsResolver,
+                                    isMainModule: (Job) -> Bool,
+                                    uniqueExplicitDependencyTracker: UniqueExplicitDependencyJobTracker? = nil) throws {
+        // Add build jobs to the manifest
+        for job in jobs {
+            let tool = try resolver.resolve(.path(job.tool))
+            let commandLine = try job.commandLine.map{ try resolver.resolve($0) }
+            let arguments = [tool] + commandLine
+
+            // Check if an explicit pre-build dependency job has already been
+            // added as a part of this build.
+            if let uniqueDependencyTracker = uniqueExplicitDependencyTracker,
+               job.isExplicitDependencyPreBuildJob {
+                if try !uniqueDependencyTracker.registerExplicitDependencyBuildJob(job) {
+                    // This is a duplicate of a previously-seen identical job.
+                    // Skip adding it to the manifest
+                    continue
+                }
+            }
+
+            let jobInputs = try job.inputs.map { try $0.resolveToNode(fileSystem: self.fileSystem) }
+            let jobOutputs = try job.outputs.map { try $0.resolveToNode(fileSystem: self.fileSystem) }
+
+            // Add target dependencies as inputs to the main module build command.
+            //
+            // Jobs for a target's intermediate build artifacts, such as PCMs or
+            // modules built from a .swiftinterface, do not have a
+            // dependency on cross-target build products. If multiple targets share
+            // common intermediate dependency modules, such dependencies can lead
+            // to cycles in the resulting manifest.
+            var manifestNodeInputs : [Node] = []
+            if buildParameters.useExplicitModuleBuild && !isMainModule(job) {
+                manifestNodeInputs = jobInputs
+            } else {
+                manifestNodeInputs = (inputs + jobInputs).uniqued()
+            }
+
+            guard let firstJobOutput = jobOutputs.first else {
+                throw InternalError("unknown first JobOutput")
+            }
+
+            let moduleName = targetDescription.target.c99name
+            let description = job.description
+            if job.kind.isSwiftFrontend {
+                manifest.addSwiftFrontendCmd(
+                    name: firstJobOutput.name,
+                    moduleName: moduleName,
+                    description: description,
+                    inputs: manifestNodeInputs,
+                    outputs: jobOutputs,
+                    arguments: arguments
+                )
+            } else {
+                manifest.addShellCmd(
+                    name: firstJobOutput.name,
+                    description: description,
+                    inputs: manifestNodeInputs,
+                    outputs: jobOutputs,
+                    arguments: arguments
+                )
+            }
+        }
+    }
+
+    private func addSwiftDriverJobs(for targetDescription: MixedTargetBuildDescription,
                                     jobs: [Job], inputs: [Node],
                                     resolver: ArgsResolver,
                                     isMainModule: (Job) -> Bool,
@@ -377,6 +471,8 @@ extension LLBuildManifestBuilder {
                                                                      explicitDependencyJobTracker: explicitDependencyJobTracker)
                 case .clang(let desc):
                     try self.createClangCompileCommand(desc)
+                case .mixed(let desc):
+                    try self.createMixedCompileCommand(desc)
             }
         }
     }
@@ -501,6 +597,32 @@ extension LLBuildManifestBuilder {
         )
     }
 
+    private func addSwiftCmdsEmitSwiftModuleSeparately(
+        _ target: MixedTargetBuildDescription,
+        inputs: [Node],
+        objectNodes: [Node],
+        moduleNode: Node
+    ) throws {
+        // FIXME: We need to ingest the emitted dependencies.
+
+        manifest.addShellCmd(
+            name: target.moduleOutputPath.pathString,
+            description: "Emitting module for \(target.target.name)",
+            inputs: inputs,
+            outputs: [moduleNode],
+            arguments: try target.emitModuleCommandLine()
+        )
+
+        let cmdName = target.target.getCommandName(config: buildConfig)
+        manifest.addShellCmd(
+            name: cmdName,
+            description: "Compiling module \(target.target.name)",
+            inputs: inputs,
+            outputs: objectNodes,
+            arguments: try target.emitObjectsCommandLine()
+        )
+    }
+
     private func addCmdWithBuiltinSwiftTool(
         _ target: SwiftTargetBuildDescription,
         inputs: [Node],
@@ -522,6 +644,32 @@ extension LLBuildManifestBuilder {
             objects: target.objects,
             otherArguments: try target.compileArguments(),
             sources: target.sources,
+            isLibrary: isLibrary,
+            wholeModuleOptimization: buildParameters.configuration == .release
+        )
+    }
+
+    private func addCmdWithBuiltinSwiftTool(
+        _ target: MixedTargetBuildDescription,
+        inputs: [Node],
+        cmdOutputs: [Node]
+    ) throws {
+        let isLibrary = target.target.type == .library || target.target.type == .test
+        let cmdName = target.target.getCommandName(config: buildConfig)
+
+        manifest.addSwiftCmd(
+            name: cmdName,
+            inputs: inputs,
+            outputs: cmdOutputs,
+            executable: buildParameters.toolchain.swiftCompilerPath,
+            moduleName: target.target.c99name,
+            moduleAliases: target.target.moduleAliases,
+            moduleOutputPath: target.moduleOutputPath,
+            importPath: buildParameters.buildPath,
+            tempsPath: target.tempsPath,
+            objects: target.swiftObjects,
+            otherArguments: try target.compileArguments(),
+            sources: target.sources.filter({ $0.extension == "swift"}),
             isLibrary: isLibrary,
             wholeModuleOptimization: buildParameters.configuration == .release
         )
@@ -568,6 +716,10 @@ extension LLBuildManifestBuilder {
                 inputs.append(file: target.moduleOutputPath)
             case .clang(let target)?:
                 for object in target.objects {
+                    inputs.append(file: object)
+                }
+            case .mixed(let target)?:
+                for object in target.clangObjects + target.swiftObjects {
                     inputs.append(file: object)
                 }
             case nil:
@@ -654,6 +806,43 @@ extension LLBuildManifestBuilder {
             }
             addNode(targetOutput, toTarget: .test)
         }
+    }
+
+    /// Adds a top-level phony command that builds the entire target.
+    private func addTargetCmd(_ target: MixedTargetBuildDescription, cmdOutputs: [Node]) {
+        // Create a phony node to represent the entire target.
+        let targetName = target.target.getLLBuildTargetName(config: buildConfig)
+        let targetOutput: Node = .virtual(targetName)
+
+        manifest.addNode(targetOutput, toTarget: targetName)
+        manifest.addPhonyCmd(
+            name: targetOutput.name,
+            inputs: cmdOutputs,
+            outputs: [targetOutput]
+        )
+        if plan.graph.isInRootPackages(target.target) {
+            if !target.isTestTarget {
+                addNode(targetOutput, toTarget: .main)
+            }
+            addNode(targetOutput, toTarget: .test)
+        }
+    }
+
+    private func addModuleWrapCmd(_ target: MixedTargetBuildDescription) throws {
+        // Add commands to perform the module wrapping Swift modules when debugging strategy is `modulewrap`.
+        guard buildParameters.debuggingStrategy == .modulewrap else { return }
+        var moduleWrapArgs = [
+            target.buildParameters.toolchain.swiftCompilerPath.pathString,
+            "-modulewrap", target.moduleOutputPath.pathString,
+            "-o", target.wrappedModuleOutputPath.pathString
+        ]
+        moduleWrapArgs += try buildParameters.targetTripleArgs(for: target.target)
+        manifest.addShellCmd(
+            name: target.wrappedModuleOutputPath.pathString,
+            description: "Wrapping AST for \(target.target.name) for debugging",
+            inputs: [.file(target.moduleOutputPath)],
+            outputs: [.file(target.wrappedModuleOutputPath)],
+            arguments: moduleWrapArgs)
     }
 
     private func addModuleWrapCmd(_ target: SwiftTargetBuildDescription) throws {
@@ -816,6 +1005,159 @@ extension LLBuildManifestBuilder {
             addNode(output, toTarget: .test)
         }
     }
+
+    private func createClangCompileCommand(
+        _ target: MixedTargetBuildDescription
+    ) throws {
+        let standards = [
+            (target.clangTarget.cxxLanguageStandard, SupportedLanguageExtension.cppExtensions),
+            (target.clangTarget.cLanguageStandard, SupportedLanguageExtension.cExtensions),
+        ]
+
+        var inputs: [Node] = []
+
+//        // Add resources node as the input to the target. This isn't great because we
+//        // don't need to block building of a module until its resources are assembled but
+//        // we don't currently have a good way to express that resources should be built
+//        // whenever a module is being built.
+//        if let resourcesNode = createResourcesBundle(for: .clang(target)) {
+//            inputs.append(resourcesNode)
+//        }
+
+        func addStaticTargetInputs(_ target: ResolvedTarget) {
+            if case .swift(let desc)? = plan.targetMap[target], target.type == .library {
+                inputs.append(file: desc.moduleOutputPath)
+            }
+        }
+
+        for dependency in target.target.dependencies(satisfying: buildEnvironment) {
+            switch dependency {
+            case .target(let target, _):
+                addStaticTargetInputs(target)
+
+            case .product(let product, _):
+                switch product.type {
+                case .executable, .snippet, .library(.dynamic):
+                    guard let planProduct = plan.productMap[product] else {
+                        throw InternalError("unknown product \(product)")
+                    }
+                    // Establish a dependency on binary of the product.
+                    let binary = planProduct.binary
+                    inputs.append(file: binary)
+
+                case .library(.automatic), .library(.static), .plugin:
+                    for target in product.targets {
+                        addStaticTargetInputs(target)
+                    }
+                case .test:
+                    break
+                }
+            }
+        }
+
+        for binaryPath in target.libraryBinaryPaths {
+            let path = destinationPath(forBinaryAt: binaryPath)
+            if self.fileSystem.isDirectory(binaryPath) {
+                inputs.append(directory: path)
+            } else {
+                inputs.append(file: path)
+            }
+        }
+
+        var objectFileNodes: [Node] = []
+
+        for path in target.compilePaths() {
+            let isCXX = path.source.extension.map{ SupportedLanguageExtension.cppExtensions.contains($0) } ?? false
+            var args = try target.basicArguments(isCXX: isCXX)
+
+            args += ["-MD", "-MT", "dependencies", "-MF", path.deps.pathString]
+
+            // Add language standard flag if needed.
+            if let ext = path.source.extension {
+                for (standard, validExtensions) in standards {
+                    if let languageStandard = standard, validExtensions.contains(ext) {
+                        args += ["-std=\(languageStandard)"]
+                    }
+                }
+            }
+
+            args += ["-c", path.source.pathString, "-o", path.object.pathString]
+
+            let clangCompiler = try buildParameters.toolchain.getClangCompiler().pathString
+            args.insert(clangCompiler, at: 0)
+
+            let objectFileNode: Node = .file(path.object)
+            objectFileNodes.append(objectFileNode)
+
+            manifest.addClangCmd(
+                name: path.object.pathString,
+                description: "Compiling \(target.target.name) \(path.filename)",
+                inputs: inputs + [.file(path.source)],
+                outputs: [objectFileNode],
+                arguments: args,
+                dependencies: path.deps.pathString
+            )
+        }
+
+        // Create a phony node to represent the entire target.
+        let targetName = target.target.getLLBuildTargetName(config: buildConfig)
+        let output: Node = .virtual(targetName + "-ObjC")
+
+        manifest.addNode(output, toTarget: targetName)
+        manifest.addPhonyCmd(
+            name: output.name,
+            inputs: objectFileNodes,
+            outputs: [output]
+        )
+
+        if plan.graph.isInRootPackages(target.target) {
+            if !target.isTestTarget {
+                addNode(output, toTarget: .main)
+            }
+            addNode(output, toTarget: .test)
+        }
+    }
+
+    private func createMixedCompileCommand(
+        _ description: MixedTargetBuildDescription
+    ) throws {
+        // --------------------------------
+        // Swift stuff
+        // --------------------------------
+
+        // Inputs.
+        var inputs = description.sources.filter { $0.extension == "swift"}.map(Node.file)
+
+        // Add resources node as the input to the target. This isn't great because we
+        // don't need to block building of a module until its resources are assembled but
+        // we don't currently have a good way to express that resources should be built
+        // whenever a module is being built.
+        if let resourcesNode = createResourcesBundle(for: .mixed(description)) {
+            inputs.append(resourcesNode)
+        }
+
+        // Outputs.
+        let objectNodes = description.swiftObjects.map(Node.file)
+        let moduleNode = Node.file(description.moduleOutputPath)
+        let cmdOutputs = objectNodes + [moduleNode]
+
+        if buildParameters.useIntegratedSwiftDriver {
+            try self.addSwiftCmdsViaIntegratedDriver(description, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
+        } else if buildParameters.emitSwiftModuleSeparately {
+            try self.addSwiftCmdsEmitSwiftModuleSeparately(description, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
+        } else {
+            try self.addCmdWithBuiltinSwiftTool(description, inputs: inputs, cmdOutputs: cmdOutputs)
+        }
+
+        self.addTargetCmd(description, cmdOutputs: cmdOutputs)
+        try self.addModuleWrapCmd(description)
+
+        // --------------------------------
+        // Clang stuff
+        // --------------------------------
+        try self.createClangCompileCommand(description)
+    }
+
 }
 
 // MARK:- Test File Generation

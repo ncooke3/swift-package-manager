@@ -164,6 +164,9 @@ public enum TargetBuildDescription {
     /// Clang target description.
     case clang(ClangTargetBuildDescription)
 
+    /// Mixed target description.
+    case mixed(MixedTargetBuildDescription)
+
     /// The objects in this target.
     var objects: [AbsolutePath] {
         switch self {
@@ -171,6 +174,8 @@ public enum TargetBuildDescription {
             return target.objects
         case .clang(let target):
             return target.objects
+        case .mixed(let target):
+            return target.clangObjects + target.swiftObjects
         }
     }
 
@@ -182,6 +187,8 @@ public enum TargetBuildDescription {
         case .clang(let target):
             // TODO: Clang targets should support generated resources in the future.
             return target.target.underlyingTarget.resources
+        case .mixed(let target):
+            return target.resources
         }
     }
 
@@ -192,6 +199,8 @@ public enum TargetBuildDescription {
             return target.bundlePath
         case .clang(let target):
             return target.bundlePath
+        case .mixed(let target):
+            return target.swiftBundlePath
         }
     }
 
@@ -200,6 +209,8 @@ public enum TargetBuildDescription {
         case .swift(let target):
             return target.target
         case .clang(let target):
+            return target.target
+        case .mixed(let target):
             return target.target
         }
     }
@@ -211,6 +222,8 @@ public enum TargetBuildDescription {
             return target.libraryBinaryPaths
         case .clang(let target):
             return target.libraryBinaryPaths
+        case .mixed(let target):
+            return target.libraryBinaryPaths
         }
     }
 
@@ -219,6 +232,8 @@ public enum TargetBuildDescription {
         case .swift(let target):
             return target.resourceBundleInfoPlistPath
         case .clang(let target):
+            return target.resourceBundleInfoPlistPath
+        case .mixed(let target):
             return target.resourceBundleInfoPlistPath
         }
     }
@@ -1188,6 +1203,920 @@ public final class SwiftTargetBuildDescription {
     }
 }
 
+/// The build description for a mixed language target.
+public final class MixedTargetBuildDescription {
+
+    // MARK: - Swift Target Build Description
+
+    /// The package this target belongs to.
+    public let package: ResolvedPackage
+
+    /// The target described by this target.
+    public let target: ResolvedTarget
+
+    /// The tools version of the package that declared the target.  This can
+    /// can be used to conditionalize semantically significant changes in how
+    /// a target is built.
+    public let toolsVersion: ToolsVersion
+
+    /// The build parameters.
+    let buildParameters: BuildParameters
+
+    /// Any addition flags to be added. These flags are expected to be computed during build planning.
+    fileprivate var clangAdditionalFlags: [String] = []
+
+    /// Path to the temporary directory for this target.
+    let tempsPath: AbsolutePath
+
+    /// The directory containing derived sources of this target.
+    ///
+    /// These are the source files generated during the build.
+    private var derivedSources: Sources
+
+    /// These are the source files derived from plugins.
+    private var pluginDerivedSources: Sources
+
+    /// These are the resource files derived from plugins.
+    private var pluginDerivedResources: [Resource]
+
+    /// Path to the bundle generated for this module (if any).
+    var swiftBundlePath: AbsolutePath? {
+        if let bundleName = target.underlyingTarget.potentialBundleName, !resources.isEmpty {
+            return buildParameters.bundlePath(named: bundleName)
+        } else {
+            return .none
+        }
+    }
+
+    /// Path to the bundle generated for this module (if any).
+    var clangBundlePath: AbsolutePath? {
+        target.underlyingTarget.bundleName.map(buildParameters.bundlePath(named:))
+    }
+
+    /// The list of all source files in the target, including the derived ones.
+    public var sources: [AbsolutePath] {
+        target.sources.paths + derivedSources.paths + pluginDerivedSources.paths
+    }
+
+    /// The list of all resource files in the target, including the derived ones.
+    public var resources: [Resource] {
+        target.underlyingTarget.resources + pluginDerivedResources
+    }
+
+    /// The objects in this target.
+    public var swiftObjects: [AbsolutePath] {
+        let relativePaths = target.sources.relativePaths + derivedSources.relativePaths + pluginDerivedSources.relativePaths
+        return relativePaths.filter({ $0.extension == "swift" }).map  {
+            AbsolutePath("\($0.pathString).o", relativeTo: tempsPath)
+        }
+    }
+
+    /// The objects in this target.
+    public var clangObjects: [AbsolutePath] {
+        return compilePaths().map({ $0.object })
+    }
+
+    /// The path to the swiftmodule file after compilation.
+    var moduleOutputPath: AbsolutePath {
+        // If we're an executable and we're not allowing test targets to link against us, we hide the module.
+        let allowLinkingAgainstExecutables = (buildParameters.triple.isDarwin() || buildParameters.triple.isLinux() || buildParameters.triple.isWindows()) && toolsVersion >= .v5_5
+        let dirPath = (target.type == .executable && !allowLinkingAgainstExecutables) ? tempsPath : buildParameters.buildPath
+        return dirPath.appending(component: target.c99name + ".swiftmodule")
+    }
+
+    /// The path to the wrapped swift module which is created using the modulewrap tool. This is required
+    /// for supporting debugging on non-Darwin platforms (On Darwin, we just pass the swiftmodule to the linker
+    /// using the `-add_ast_path` flag).
+    var wrappedModuleOutputPath: AbsolutePath {
+        return tempsPath.appending(component: target.c99name + ".swiftmodule.o")
+    }
+
+    /// The path to the swifinterface file after compilation.
+    var parseableModuleInterfaceOutputPath: AbsolutePath {
+        return buildParameters.buildPath.appending(component: target.c99name + ".swiftinterface")
+    }
+
+    /// Path to the resource Info.plist file, if generated.
+    public private(set) var resourceBundleInfoPlistPath: AbsolutePath?
+
+    /// Paths to the binary libraries the target depends on.
+    fileprivate(set) var libraryBinaryPaths: Set<AbsolutePath> = []
+
+    /// Any addition flags to be added. These flags are expected to be computed during build planning.
+    fileprivate var swiftAdditionalFlags: [String] = []
+
+    /// The swift version for this target.
+    var swiftVersion: SwiftLanguageVersion {
+        return (target.underlyingTarget as! MixedTarget).swiftVersion
+    }
+
+    /// If this target is a test target.
+    public let isTestTarget: Bool
+
+    /// True if this is the test discovery target.
+    public let isTestDiscoveryTarget: Bool
+
+    /// True if this module needs to be parsed as a library based on the target type and the configuration
+    /// of the source code (for example because it has a single source file whose name isn't "main.swift").
+    /// This deactivates heuristics in the Swift compiler that treats single-file modules and source files
+    /// named "main.swift" specially w.r.t. whether they can have an entry point.
+    ///
+    /// See https://bugs.swift.org/browse/SR-14488 for discussion about improvements so that SwiftPM can
+    /// convey the intent to build an executable module to the compiler regardless of the number of files
+    /// in the module or their names.
+    var needsToBeParsedAsLibrary: Bool {
+        switch target.type {
+        case .library, .test:
+            return true
+        case .executable:
+            guard toolsVersion >= .v5_5 else { return false }
+            let sources = self.sources
+            return sources.count == 1 && sources.first?.basename != "main.swift"
+        default:
+            return false
+        }
+    }
+
+    /// The filesystem to operate on.
+    let fileSystem: FileSystem
+
+    /// The modulemap file for this target, if any.
+    private(set) var moduleMap: AbsolutePath?
+
+    /// The results of applying any build tool plugins to this target.
+    public let buildToolPluginInvocationResults: [BuildToolPluginInvocationResult]
+
+    /// The results of running any prebuild commands for this target.
+    public let prebuildCommandResults: [PrebuildCommandResult]
+
+    /// ObservabilityScope with which to emit diagnostics
+    private let observabilityScope: ObservabilityScope
+
+    /// Create a new target description with target and build parameters.
+    init(
+        package: ResolvedPackage,
+        target: ResolvedTarget,
+        toolsVersion: ToolsVersion,
+        additionalFileRules: [FileRuleDescription] = [],
+        buildParameters: BuildParameters,
+        buildToolPluginInvocationResults: [BuildToolPluginInvocationResult] = [],
+        prebuildCommandResults: [PrebuildCommandResult] = [],
+        isTestTarget: Bool? = nil,
+        isTestDiscoveryTarget: Bool = false,
+        fileSystem: FileSystem,
+        observabilityScope: ObservabilityScope
+    ) throws {
+        guard target.underlyingTarget is MixedTarget else {
+            throw InternalError("underlying target type mismatch \(target)")
+        }
+        self.package = package
+        self.target = target
+        self.toolsVersion = toolsVersion
+        self.buildParameters = buildParameters
+        // Unless mentioned explicitly, use the target type to determine if this is a test target.
+        self.isTestTarget = isTestTarget ?? (target.type == .test)
+        self.isTestDiscoveryTarget = isTestDiscoveryTarget
+        self.fileSystem = fileSystem
+        self.tempsPath = buildParameters.buildPath.appending(component: target.c99name + ".build")
+        self.derivedSources = Sources(paths: [], root: tempsPath.appending(component: "DerivedSources"))
+        self.pluginDerivedSources = Sources(paths: [], root: buildParameters.dataPath)
+        self.buildToolPluginInvocationResults = buildToolPluginInvocationResults
+        self.prebuildCommandResults = prebuildCommandResults
+        self.observabilityScope = observabilityScope
+
+        // Add any derived files that were declared for any commands from plugin invocations.
+        var pluginDerivedFiles = [AbsolutePath]()
+        for command in buildToolPluginInvocationResults.reduce([], { $0 + $1.buildCommands }) {
+            for absPath in command.outputFiles {
+                pluginDerivedFiles.append(absPath)
+            }
+        }
+
+        // Add any derived files that were discovered from output directories of prebuild commands.
+        for result in self.prebuildCommandResults {
+            for path in result.derivedFiles {
+                pluginDerivedFiles.append(path)
+            }
+        }
+
+        // Let `TargetSourcesBuilder` compute the treatment of plugin generated files.
+        let (derivedSources, derivedResources) = TargetSourcesBuilder.computeContents(for: pluginDerivedFiles, toolsVersion: toolsVersion, additionalFileRules: additionalFileRules, defaultLocalization: target.defaultLocalization, targetName: target.name, targetPath: target.underlyingTarget.path, observabilityScope: observabilityScope)
+        self.pluginDerivedResources = derivedResources
+        derivedSources.forEach { absPath in
+            let relPath = absPath.relative(to: self.pluginDerivedSources.root)
+            self.pluginDerivedSources.relativePaths.append(relPath)
+        }
+
+        if shouldEmitObjCCompatibilityHeader {
+            self.moduleMap = try self.generateModuleMap()
+        }
+
+        // TODO(ncooke3): Copied from Clang-based initializer.
+        // Try computing modulemap path for a C library.  This also creates the file in the file system, if needed.
+        if target.type == .library {
+            // If there's a custom module map, use it as given.
+            if case .custom(let path) = clangTarget.moduleMapType {
+                self.moduleMap = path
+            }
+            // If a generated module map is needed, generate one now in our temporary directory.
+            else if let generatedModuleMapType = clangTarget.moduleMapType.generatedModuleMapType {
+                let path = tempsPath.appending(component: moduleMapFilename)
+                let moduleMapGenerator = ModuleMapGenerator(targetName: clangTarget.name, moduleName: clangTarget.c99name, publicHeadersDir: clangTarget.includeDir, fileSystem: fileSystem)
+                try moduleMapGenerator.generateModuleMap(type: generatedModuleMapType, at: path)
+                self.moduleMap = path
+                // TODO(ncooke3): Modify the module map to include the Swift header.
+            }
+            // Otherwise there is no module map, and we leave `moduleMap` unset.
+        }
+
+        // Do nothing if we're not generating a bundle.
+        // TODO(ncooke3): The Clang based initializer had the same check.
+        if swiftBundlePath != nil {
+            try self.swiftGenerateResourceAccessor()
+
+            let infoPlistPath = tempsPath.appending(component: "Info.plist")
+            if try generateResourceInfoPlist(fileSystem: self.fileSystem, target: target, path: infoPlistPath) {
+                resourceBundleInfoPlistPath = infoPlistPath
+            }
+        }
+    }
+
+    /// Generate the resource bundle accessor, if appropriate.
+    private func swiftGenerateResourceAccessor() throws {
+        // Do nothing if we're not generating a bundle.
+        guard let bundlePath = self.swiftBundlePath else { return }
+
+        let mainPathSubstitution: String
+        if buildParameters.triple.isWASI() {
+            // We prefer compile-time evaluation of the bundle path here for WASI. There's no benefit in evaluating this at runtime,
+            // especially as Bundle support in WASI Foundation is partial. We expect all resource paths to evaluate to
+            // `/\(resourceBundleName)/\(resourcePath)`, which allows us to pass this path to JS APIs like `fetch` directly, or to
+            // `<img src=` HTML attributes. The resources are loaded from the server, and we can't hardcode the host part in the URL.
+            // Making URLs relative by starting them with `/\(resourceBundleName)` makes it work in the browser.
+            let mainPath = AbsolutePath(Bundle.main.bundlePath).appending(component: bundlePath.basename).pathString
+            mainPathSubstitution = #""\#(mainPath.asSwiftStringLiteralConstant)""#
+        } else {
+            mainPathSubstitution = #"Bundle.main.bundleURL.appendingPathComponent("\#(bundlePath.basename.asSwiftStringLiteralConstant)").path"#
+        }
+
+        let stream = BufferedOutputByteStream()
+        stream <<< """
+        import class Foundation.Bundle
+
+        extension Foundation.Bundle {
+            static var module: Bundle = {
+                let mainPath = \(mainPathSubstitution)
+                let buildPath = "\(bundlePath.pathString.asSwiftStringLiteralConstant)"
+
+                let preferredBundle = Bundle(path: mainPath)
+
+                guard let bundle = preferredBundle ?? Bundle(path: buildPath) else {
+                    fatalError("could not load resource bundle: from \\(mainPath) or \\(buildPath)")
+                }
+
+                return bundle
+            }()
+        }
+        """
+
+        let subpath = RelativePath("resource_bundle_accessor.swift")
+
+        // Add the file to the derived sources.
+        derivedSources.relativePaths.append(subpath)
+
+        // Write this file out.
+        // FIXME: We should generate this file during the actual build.
+        let path = derivedSources.root.appending(subpath)
+        try self.fileSystem.writeIfChanged(path: path, bytes: stream.bytes)
+    }
+
+    public static func checkSupportedFrontendFlags(flags: Set<String>, fileSystem: FileSystem) -> Bool {
+        do {
+            let executor = try SPMSwiftDriverExecutor(resolver: ArgsResolver(fileSystem: fileSystem), fileSystem: fileSystem, env: [:])
+            let driver = try Driver(args: ["swiftc"], executor: executor)
+            return driver.supportedFrontendFlags.intersection(flags) == flags
+        } catch {
+            return false
+        }
+    }
+
+    /// The arguments needed to compile this target.
+    public func compileArguments() throws -> [String] {
+        var args = [String]()
+        args += try buildParameters.targetTripleArgs(for: target)
+        args += ["-swift-version", swiftVersion.rawValue]
+
+        // Enable batch mode in debug mode.
+        //
+        // Technically, it should be enabled whenever WMO is off but we
+        // don't currently make that distinction in SwiftPM
+        switch buildParameters.configuration {
+        case .debug:
+            args += ["-enable-batch-mode"]
+        case .release: break
+        }
+
+        args += buildParameters.indexStoreArguments(for: target)
+        args += swiftOptimizationArguments
+        args += testingArguments
+        args += ["-g"]
+        args += ["-j\(buildParameters.jobs)"]
+        args += swiftActiveCompilationConditions
+        args += swiftAdditionalFlags
+        args += swiftModuleCacheArgs
+        args += stdlibArguments
+        args += buildParameters.sanitizers.compileSwiftFlags()
+        args += ["-parseable-output"]
+
+        // If we're compiling the main module of an executable other than the one that
+        // implements a test suite, and if the package tools version indicates that we
+        // should, we rename the `_main` entry point to `_<modulename>_main`.
+        //
+        // This will allow tests to link against the module without any conflicts. And
+        // when we link the executable, we will ask the linker to rename the entry point
+        // symbol to just `_main` again (or if the linker doesn't support it, we'll
+        // generate a source containing a redirect).
+        if (target.type == .executable || target.type == .snippet)
+           && !isTestTarget && toolsVersion >= .v5_5 {
+            // We only do this if the linker supports it, as indicated by whether we
+            // can construct the linker flags. In the future we will use a generated
+            // code stub for the cases in which the linker doesn't support it, so that
+            // we can rename the symbol unconditionally.
+            // No `-` for these flags because the set of Strings in driver.supportedFrontendFlags do
+            // not have a leading `-`
+            if buildParameters.canRenameEntrypointFunctionName,
+               buildParameters.linkerFlagsForRenamingMainFunction(of: target) != nil {
+                args += ["-Xfrontend", "-entry-point-function-name", "-Xfrontend", "\(target.c99name)_main"]
+            }
+        }
+
+        // If the target needs to be parsed without any special semantics involving "main.swift", do so now.
+        if self.needsToBeParsedAsLibrary {
+            args += ["-parse-as-library"]
+        }
+
+        // Only add the build path to the framework search path if there are binary frameworks to link against.
+        if !libraryBinaryPaths.isEmpty {
+            args += ["-F", buildParameters.buildPath.pathString]
+        }
+
+        // Emit the ObjC compatibility header if enabled.
+        if shouldEmitObjCCompatibilityHeader {
+            args += ["-emit-objc-header", "-emit-objc-header-path", objCompatibilityHeaderPath.pathString]
+        }
+
+        // Add arguments needed for code coverage if it is enabled.
+        if buildParameters.enableCodeCoverage {
+            args += ["-profile-coverage-mapping", "-profile-generate"]
+        }
+
+        // Add arguments to colorize output if stdout is tty
+        if buildParameters.colorizedOutput {
+            args += ["-color-diagnostics"]
+        }
+
+        // Add arguments from declared build settings.
+        args += self.swiftBuildSettingsFlags()
+
+        // Add the output for the `.swiftinterface`, if requested or if library evolution has been enabled some other way.
+        if buildParameters.enableParseableModuleInterfaces || args.contains("-enable-library-evolution") {
+            args += ["-emit-module-interface-path", parseableModuleInterfaceOutputPath.pathString]
+        }
+
+        args += buildParameters.toolchain.extraSwiftCFlags
+        // User arguments (from -Xswiftc) should follow generated arguments to allow user overrides
+        args += buildParameters.swiftCompilerFlags
+
+        // suppress warnings if the package is remote
+        if self.package.isRemote {
+            args += ["-suppress-warnings"]
+            // suppress-warnings and warnings-as-errors are mutually exclusive
+            if let index = args.firstIndex(of: "-warnings-as-errors") {
+                args.remove(at: index)
+            }
+        }
+
+        return args
+    }
+
+    /// When `scanInvocation` argument is set to `true`, omit the side-effect producing arguments
+    /// such as emitting a module or supplementary outputs.
+    public func emitCommandLine(scanInvocation: Bool = false) throws -> [String] {
+        var result: [String] = []
+        result.append(buildParameters.toolchain.swiftCompilerPath.pathString)
+
+        result.append("-module-name")
+        result.append(target.c99name)
+
+        if !scanInvocation {
+            result.append("-emit-dependencies")
+
+            // FIXME: Do we always have a module?
+            result.append("-emit-module")
+            result.append("-emit-module-path")
+            result.append(moduleOutputPath.pathString)
+
+            result.append("-output-file-map")
+            // FIXME: Eliminate side effect.
+            result.append(try writeOutputFileMap().pathString)
+        }
+
+        if buildParameters.useWholeModuleOptimization {
+            result.append("-whole-module-optimization")
+            result.append("-num-threads")
+            result.append(String(ProcessInfo.processInfo.activeProcessorCount))
+        } else {
+            result.append("-incremental")
+        }
+
+        result.append("-c")
+        result.append(contentsOf: sources.filter {
+            $0.extension != "swift"
+        }.map { $0.pathString })
+
+        result.append("-I")
+        result.append(buildParameters.buildPath.pathString)
+
+        result += try self.compileArguments()
+        return result
+     }
+
+    /// Command-line for emitting just the Swift module.
+    public func emitModuleCommandLine() throws -> [String] {
+        guard buildParameters.emitSwiftModuleSeparately else {
+            throw InternalError("expecting emitSwiftModuleSeparately in build parameters")
+        }
+
+        var result: [String] = []
+        result.append(buildParameters.toolchain.swiftCompilerPath.pathString)
+
+        result.append("-module-name")
+        result.append(target.c99name)
+        result.append("-emit-module")
+        result.append("-emit-module-path")
+        result.append(moduleOutputPath.pathString)
+        result += buildParameters.toolchain.extraSwiftCFlags
+
+        result.append("-Xfrontend")
+        result.append("-experimental-skip-non-inlinable-function-bodies")
+        result.append("-force-single-frontend-invocation")
+
+        // FIXME: Handle WMO
+
+        for source in target.sources.paths {
+            result.append(source.pathString)
+        }
+
+        result.append("-I")
+        result.append(buildParameters.buildPath.pathString)
+
+        // FIXME: Maybe refactor these into "common args".
+        result += try buildParameters.targetTripleArgs(for: target)
+        result += ["-swift-version", swiftVersion.rawValue]
+        result += swiftOptimizationArguments
+        result += testingArguments
+        result += ["-g"]
+        result += ["-j\(buildParameters.jobs)"]
+        result += swiftActiveCompilationConditions
+        result += swiftAdditionalFlags
+        result += swiftModuleCacheArgs
+        result += stdlibArguments
+        result += self.swiftBuildSettingsFlags()
+
+        return result
+    }
+
+    /// Command-line for emitting the object files.
+    ///
+    /// Note: This doesn't emit the module.
+    public func emitObjectsCommandLine() throws -> [String] {
+        guard buildParameters.emitSwiftModuleSeparately else {
+            throw InternalError("expecting emitSwiftModuleSeparately in build parameters")
+        }
+
+        var result: [String] = []
+        result.append(buildParameters.toolchain.swiftCompilerPath.pathString)
+
+        result.append("-module-name")
+        result.append(target.c99name)
+        result.append("-incremental")
+        result.append("-emit-dependencies")
+
+        result.append("-output-file-map")
+        // FIXME: Eliminate side effect.
+        result.append(try writeOutputFileMap().pathString)
+
+        // FIXME: Handle WMO
+
+        result.append("-c")
+        for source in target.sources.paths.filter({ $0.extension == "swift"
+        }) {
+            result.append(source.pathString)
+        }
+
+        result.append("-I")
+        result.append(buildParameters.buildPath.pathString)
+
+        result += try buildParameters.targetTripleArgs(for: target)
+        result += ["-swift-version", swiftVersion.rawValue]
+
+        result += buildParameters.indexStoreArguments(for: target)
+        result += swiftOptimizationArguments
+        result += testingArguments
+        result += ["-g"]
+        result += ["-j\(buildParameters.jobs)"]
+        result += swiftActiveCompilationConditions
+        result += swiftAdditionalFlags
+        result += swiftModuleCacheArgs
+        result += stdlibArguments
+        result += buildParameters.sanitizers.compileSwiftFlags()
+        result += ["-parseable-output"]
+        result += self.swiftBuildSettingsFlags()
+        result += buildParameters.toolchain.extraSwiftCFlags
+        result += buildParameters.swiftCompilerFlags
+        return result
+    }
+
+    /// Returns true if ObjC compatibility header should be emitted.
+    private var shouldEmitObjCCompatibilityHeader: Bool {
+        return buildParameters.triple.isDarwin() && target.type == .library
+    }
+
+    private func writeOutputFileMap() throws -> AbsolutePath {
+        let path = tempsPath.appending(component: "output-file-map.json")
+        let stream = BufferedOutputByteStream()
+
+        stream <<< "{\n"
+
+        let masterDepsPath = tempsPath.appending(component: "master.swiftdeps")
+        stream <<< "  \"\": {\n"
+        if buildParameters.useWholeModuleOptimization {
+            let moduleName = target.c99name
+            stream <<< "    \"dependencies\": \"" <<< tempsPath.appending(component: moduleName + ".d").nativePathString(escaped: true) <<< "\",\n"
+            // FIXME: Need to record this deps file for processing it later.
+            stream <<< "    \"object\": \"" <<< tempsPath.appending(component: moduleName + ".o").nativePathString(escaped: true) <<< "\",\n"
+        }
+        stream <<< "    \"swift-dependencies\": \"" <<< masterDepsPath.nativePathString(escaped: true) <<< "\"\n"
+
+        stream <<< "  },\n"
+
+        // Write out the entries for each source file.
+        let sources = target.sources.paths + derivedSources.paths + pluginDerivedSources.paths
+        for (idx, source) in sources.enumerated() {
+            let object = swiftObjects[idx]
+            let objectDir = object.parentDirectory
+
+            let sourceFileName = source.basenameWithoutExt
+
+            let swiftDepsPath = objectDir.appending(component: sourceFileName + ".swiftdeps")
+
+            stream <<< "  \"" <<< source.nativePathString(escaped: true) <<< "\": {\n"
+
+            if (!buildParameters.useWholeModuleOptimization) {
+                let depsPath = objectDir.appending(component: sourceFileName + ".d")
+                stream <<< "    \"dependencies\": \"" <<< depsPath.nativePathString(escaped: true) <<< "\",\n"
+                // FIXME: Need to record this deps file for processing it later.
+            }
+
+            stream <<< "    \"object\": \"" <<< object.nativePathString(escaped: true) <<< "\",\n"
+
+            let partialModulePath = objectDir.appending(component: sourceFileName + "~partial.swiftmodule")
+            stream <<< "    \"swiftmodule\": \"" <<< partialModulePath.nativePathString(escaped: true) <<< "\",\n"
+            stream <<< "    \"swift-dependencies\": \"" <<< swiftDepsPath.nativePathString(escaped: true) <<< "\"\n"
+            stream <<< "  }" <<< ((idx + 1) < sources.count ? "," : "") <<< "\n"
+        }
+
+        stream <<< "}\n"
+
+        try self.fileSystem.createDirectory(path.parentDirectory, recursive: true)
+        try self.fileSystem.writeFileContents(path, bytes: stream.bytes)
+        return path
+    }
+
+    /// Generates the module map for the Swift target and returns its path.
+    private func generateModuleMap() throws -> AbsolutePath {
+        let path = tempsPath.appending(component: moduleMapFilename)
+
+        let stream = BufferedOutputByteStream()
+        stream <<< "module \(target.c99name) {\n"
+        stream <<< "    header \"" <<< objCompatibilityHeaderPath.pathString <<< "\"\n"
+        stream <<< "    requires objc\n"
+        stream <<< "}\n"
+
+        // Return early if the contents are identical.
+        if self.fileSystem.isFile(path), try self.fileSystem.readFileContents(path) == stream.bytes {
+            return path
+        }
+
+        try self.fileSystem.createDirectory(path.parentDirectory, recursive: true)
+        try self.fileSystem.writeFileContents(path, bytes: stream.bytes)
+
+        return path
+    }
+
+    /// Returns the path to the ObjC compatibility header for this Swift target.
+    var objCompatibilityHeaderPath: AbsolutePath {
+        return tempsPath.appending(component: "\(target.name)-Swift.h")
+    }
+
+    /// Returns the build flags from the declared build settings.
+    private func swiftBuildSettingsFlags() -> [String] {
+        let scope = buildParameters.createScope(for: target)
+        var flags: [String] = []
+
+        // Swift defines.
+        let swiftDefines = scope.evaluate(.SWIFT_ACTIVE_COMPILATION_CONDITIONS)
+        flags += swiftDefines.map({ "-D" + $0 })
+
+        // Other Swift flags.
+        flags += scope.evaluate(.OTHER_SWIFT_FLAGS)
+
+        // Add C flags by prefixing them with -Xcc.
+        //
+        // C defines.
+        let cDefines = scope.evaluate(.GCC_PREPROCESSOR_DEFINITIONS)
+        flags += cDefines.flatMap({ ["-Xcc", "-D" + $0] })
+
+        // Header search paths.
+        let headerSearchPaths = scope.evaluate(.HEADER_SEARCH_PATHS)
+        flags += headerSearchPaths.flatMap({ path -> [String] in
+            return ["-Xcc", "-I\(AbsolutePath(path, relativeTo: target.sources.root).pathString)"]
+        })
+
+        // Other C flags.
+        flags += scope.evaluate(.OTHER_CFLAGS).flatMap({ ["-Xcc", $0] })
+
+        return flags
+    }
+
+    /// A list of compilation conditions to enable for conditional compilation expressions.
+    private var swiftActiveCompilationConditions: [String] {
+        var compilationConditions = ["-DSWIFT_PACKAGE"]
+
+        switch buildParameters.configuration {
+        case .debug:
+            compilationConditions += ["-DDEBUG"]
+        case .release:
+            break
+        }
+
+        return compilationConditions
+    }
+
+    /// Optimization arguments according to the build configuration.
+    private var swiftOptimizationArguments: [String] {
+        switch buildParameters.configuration {
+        case .debug:
+            return ["-Onone"]
+        case .release:
+            return ["-O"]
+        }
+    }
+
+    /// Testing arguments according to the build configuration.
+    private var testingArguments: [String] {
+        if self.isTestTarget {
+            // test targets must be built with -enable-testing
+            // since its required for test discovery (the non objective-c reflection kind)
+            return ["-enable-testing"]
+        } else if buildParameters.enableTestability {
+            return ["-enable-testing"]
+        } else {
+            return []
+        }
+    }
+
+    /// Module cache arguments.
+    private var swiftModuleCacheArgs: [String] {
+        return ["-module-cache-path", buildParameters.moduleCache.pathString]
+    }
+
+    private var stdlibArguments: [String] {
+        if buildParameters.shouldLinkStaticSwiftStdlib &&
+            buildParameters.triple.isSupportingStaticStdlib {
+            return ["-static-stdlib"]
+        } else {
+            return []
+        }
+    }
+
+    // MARK: - C-Family Target Build Description
+
+    /// The underlying clang target.
+    public var clangTarget: MixedTarget {
+        return target.underlyingTarget as! MixedTarget
+    }
+
+    /// The build environment.
+    var buildEnvironment: BuildEnvironment {
+        buildParameters.buildEnvironment
+    }
+
+    /// Path to the resource accessor header file, if generated.
+    public private(set) var resourceAccessorHeaderFile: AbsolutePath?
+
+    /// Optimization arguments according to the build configuration.
+    private var clangOptimizationArguments: [String] {
+        switch buildParameters.configuration {
+        case .debug:
+            return ["-O0"]
+        case .release:
+            return ["-O2"]
+        }
+    }
+
+    /// A list of compilation conditions to enable for conditional compilation expressions.
+    private var clangActiveCompilationConditions: [String] {
+        var compilationConditions = ["-DSWIFT_PACKAGE=1"]
+
+        switch buildParameters.configuration {
+        case .debug:
+            compilationConditions += ["-DDEBUG=1"]
+        case .release:
+            break
+        }
+
+        return compilationConditions
+    }
+
+    /// Module cache arguments.
+    private var clangModuleCacheArgs: [String] {
+        return ["-fmodules-cache-path=\(buildParameters.moduleCache.pathString)"]
+    }
+
+    /// An array of tuple containing filename, source, object and dependency path for each of the source in this target.
+    public func compilePaths()
+        -> [(filename: RelativePath, source: AbsolutePath, object: AbsolutePath, deps: AbsolutePath)]
+    {
+        let sources = [
+            target.sources.root: target.sources.relativePaths,
+            derivedSources.root: derivedSources.relativePaths,
+        ]
+
+        return sources.flatMap { (root, relativePaths) in
+            relativePaths.filter({ $0.extension != "swift"
+            }).map { source in
+                let path = root.appending(source)
+                let object = AbsolutePath("\(source.pathString).o", relativeTo: tempsPath)
+                let deps = AbsolutePath("\(source.pathString).d", relativeTo: tempsPath)
+                return (source, path, object, deps)
+            }
+        }
+    }
+
+    /// Builds up basic compilation arguments for a source file in this target; these arguments may be different for C++ vs non-C++.
+    /// NOTE: The parameter to specify whether to get C++ semantics is currently optional, but this is only for revlock avoidance with clients. Callers should always specify what they want based either the user's indication or on a default value (possibly based on the filename suffix).
+    public func basicArguments(isCXX isCXXOverride: Bool? = .none) throws -> [String] {
+        // For now fall back on the hold semantics if the C++ nature isn't specified. This is temporary until clients have been updated.
+        let isCXX = isCXXOverride ?? clangTarget.isCXX
+
+        var args = [String]()
+        // Only enable ARC on macOS.
+        if buildParameters.triple.isDarwin() {
+            args += ["-fobjc-arc"]
+        }
+        args += try buildParameters.targetTripleArgs(for: target)
+        args += ["-g"]
+        if buildParameters.triple.isWindows() {
+            args += ["-gcodeview"]
+        }
+        args += clangOptimizationArguments
+        args += clangActiveCompilationConditions
+        args += ["-fblocks"]
+
+        // Enable index store, if appropriate.
+        //
+        // This feature is not widely available in OSS clang. So, we only enable
+        // index store for Apple's clang or if explicitly asked to.
+        if ProcessEnv.vars.keys.contains("SWIFTPM_ENABLE_CLANG_INDEX_STORE") {
+            args += buildParameters.indexStoreArguments(for: target)
+        } else if buildParameters.triple.isDarwin(), (try? buildParameters.toolchain._isClangCompilerVendorApple()) == true {
+            args += buildParameters.indexStoreArguments(for: target)
+        }
+
+        // Enable Clang module flags, if appropriate. We enable them except in these cases:
+        // 1. on Darwin when compiling for C++, because C++ modules are disabled on Apple-built Clang releases
+        // 2. on Windows when compiling for any language, because of issues with the Windows SDK
+        // 3. on Android when compiling for any language, because of issues with the Android SDK
+        let enableModules = !(buildParameters.triple.isDarwin() && isCXX) && !buildParameters.triple.isWindows() && !buildParameters.triple.isAndroid()
+
+        if enableModules {
+            // Using modules currently conflicts with the Windows and Android SDKs.
+            args += ["-fmodules", "-fmodule-name=" + target.c99name]
+        }
+
+        // Only add the build path to the framework search path if there are binary frameworks to link against.
+        if !libraryBinaryPaths.isEmpty {
+            args += ["-F", buildParameters.buildPath.pathString]
+        }
+
+        args += ["-I", clangTarget.includeDir.pathString]
+        args += clangAdditionalFlags
+        if enableModules {
+            args += clangModuleCacheArgs
+        }
+        args += buildParameters.sanitizers.compileCFlags()
+
+        // Add arguments from declared build settings.
+        args += self.clangBuildSettingsFlags()
+
+        if let resourceAccessorHeaderFile = self.resourceAccessorHeaderFile {
+            args += ["-include", resourceAccessorHeaderFile.pathString]
+        }
+
+        args += buildParameters.toolchain.extraCCFlags
+        // User arguments (from -Xcc and -Xcxx below) should follow generated arguments to allow user overrides
+        args += buildParameters.flags.cCompilerFlags
+
+        // Add extra C++ flags if this target contains C++ files.
+        if clangTarget.isCXX {
+            args += self.buildParameters.flags.cxxCompilerFlags
+        }
+        return args
+    }
+
+    /// Returns the build flags from the declared build settings.
+    private func clangBuildSettingsFlags() -> [String] {
+        let scope = buildParameters.createScope(for: target)
+        var flags: [String] = []
+
+        // C defines.
+        let cDefines = scope.evaluate(.GCC_PREPROCESSOR_DEFINITIONS)
+        flags += cDefines.map({ "-D" + $0 })
+
+        // Header search paths.
+        let headerSearchPaths = scope.evaluate(.HEADER_SEARCH_PATHS)
+        flags += headerSearchPaths.map({
+            "-I\(AbsolutePath($0, relativeTo: target.sources.root).pathString)"
+        })
+
+        // Other C flags.
+        flags += scope.evaluate(.OTHER_CFLAGS)
+
+        // Other CXX flags.
+        flags += scope.evaluate(.OTHER_CPLUSPLUSFLAGS)
+
+        return flags
+    }
+
+    /// Generate the resource bundle accessor, if appropriate.
+    private func clangGenerateResourceAccessor() throws {
+        // Only generate access when we have a bundle and ObjC files.
+        guard let bundlePath = self.clangBundlePath, clangTarget.sources.containsObjcFiles else { return }
+
+        // Compute the basename of the bundle.
+        let bundleBasename = bundlePath.basename
+
+        let implFileStream = BufferedOutputByteStream()
+        implFileStream <<< """
+        #import <Foundation/Foundation.h>
+
+        NSBundle* \(target.c99name)_SWIFTPM_MODULE_BUNDLE() {
+            NSURL *bundleURL = [[[NSBundle mainBundle] bundleURL] URLByAppendingPathComponent:@"\(bundleBasename)"];
+            return [NSBundle bundleWithURL:bundleURL];
+        }
+        """
+
+        let implFileSubpath = RelativePath("resource_bundle_accessor.m")
+
+        // Add the file to the derived sources.
+        derivedSources.relativePaths.append(implFileSubpath)
+
+        // Write this file out.
+        // FIXME: We should generate this file during the actual build.
+        try fileSystem.writeIfChanged(
+            path: derivedSources.root.appending(implFileSubpath),
+            bytes: implFileStream.bytes
+        )
+
+        let headerFileStream = BufferedOutputByteStream()
+        headerFileStream <<< """
+        #import <Foundation/Foundation.h>
+
+        #if __cplusplus
+        extern "C" {
+        #endif
+
+        NSBundle* \(target.c99name)_SWIFTPM_MODULE_BUNDLE(void);
+
+        #define SWIFTPM_MODULE_BUNDLE \(target.c99name)_SWIFTPM_MODULE_BUNDLE()
+
+        #if __cplusplus
+        }
+        #endif
+        """
+        let headerFile = derivedSources.root.appending(component: "resource_bundle_accessor.h")
+        self.resourceAccessorHeaderFile = headerFile
+
+        try fileSystem.writeIfChanged(
+            path: headerFile,
+            bytes: headerFileStream.bytes
+        )
+    }
+
+}
+
+
 /// The build description for a product.
 public final class ProductBuildDescription {
 
@@ -1768,6 +2697,17 @@ public class BuildPlan {
                     toolsVersion: toolsVersion,
                     buildParameters: buildParameters,
                     fileSystem: fileSystem))
+            case is MixedTarget:
+                guard let package = graph.package(for: target) else {
+                    throw InternalError("package not found for \(target)")
+                }
+                targetMap[target] = try .mixed(MixedTargetBuildDescription(
+                    package: package,
+                    target: target,
+                    toolsVersion: toolsVersion,
+                    buildParameters: buildParameters,
+                    fileSystem: fileSystem,
+                    observabilityScope: observabilityScope))
             case is PluginTarget:
                 guard let package = graph.package(for: target) else {
                     throw InternalError("package not found for \(target)")
@@ -1868,6 +2808,8 @@ public class BuildPlan {
                 try self.plan(swiftTarget: target)
             case .clang(let target):
                 try self.plan(clangTarget: target)
+            case .mixed(let target):
+                try self.plan(mixedTarget: target)
             }
         }
 
@@ -2144,6 +3086,10 @@ public class BuildPlan {
         }
     }
 
+    public func plan(mixedTarget: MixedTargetBuildDescription) throws {
+        // For now, there should be no deps in the example project I'm creating.
+    }
+
     public func createAPIToolCommonArgs(includeLibrarySearchPaths: Bool) -> [String] {
         let buildPath = buildParameters.buildPath.pathString
         var arguments = ["-I", buildPath]
@@ -2166,6 +3112,10 @@ public class BuildPlan {
             switch target {
             case .swift: break
             case .clang(let targetDescription):
+                if let includeDir = targetDescription.moduleMap?.parentDirectory {
+                    arguments += ["-I", includeDir.pathString]
+                }
+            case .mixed(let targetDescription):
                 if let includeDir = targetDescription.moduleMap?.parentDirectory {
                     arguments += ["-I", includeDir.pathString]
                 }
@@ -2202,6 +3152,10 @@ public class BuildPlan {
             switch target {
                 case .swift: break
             case .clang(let targetDescription):
+                if let includeDir = targetDescription.moduleMap?.parentDirectory {
+                    arguments += ["-I\(includeDir.pathString)"]
+                }
+            case .mixed(let targetDescription):
                 if let includeDir = targetDescription.moduleMap?.parentDirectory {
                     arguments += ["-I\(includeDir.pathString)"]
                 }

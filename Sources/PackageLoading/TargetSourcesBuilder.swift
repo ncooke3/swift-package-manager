@@ -180,11 +180,6 @@ public struct TargetSourcesBuilder {
         diagnoseInfoPlistConflicts(in: resources)
         diagnoseInvalidResource(in: target.resources)
 
-        // It's an error to contain mixed language source files.
-        if sources.containsMixedLanguage {
-            throw Target.Error.mixedSources(targetPath)
-        }
-
         return (sources, resources, headers, ignored, others)
     }
 

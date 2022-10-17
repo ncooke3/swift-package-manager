@@ -45,7 +45,8 @@ class PackageBuilderTests: XCTestCase {
 
         let fs = InMemoryFileSystem(emptyFiles:
             foo.appending(components: "main.swift").pathString,
-            foo.appending(components: "main.c").pathString
+            foo.appending(components: "dummy.h").pathString,
+            foo.appending(components: "dummy.m").pathString
         )
 
         let manifest = Manifest.createRootManifest(
@@ -55,8 +56,8 @@ class PackageBuilderTests: XCTestCase {
                 try TargetDescription(name: "foo"),
             ]
         )
-        PackageBuilderTester(manifest, in: fs) { _, diagnostics in
-            diagnostics.check(diagnostic: "target at '\(foo)' contains mixed language source files; feature not supported", severity: .error)
+        PackageBuilderTester(manifest, in: fs) { package, _ in
+            package.checkModule("foo")
         }
     }
 
