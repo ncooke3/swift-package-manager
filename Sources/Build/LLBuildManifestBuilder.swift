@@ -202,7 +202,8 @@ extension LLBuildManifestBuilder {
     @discardableResult
     private func createSwiftCompileCommand(
         _ target: SwiftTargetBuildDescription,
-        addTargetCmd: Bool = true
+        addTargetCmd: Bool = true,
+        mixedTarget: Bool = false
     ) throws -> [Node] {
         // Inputs.
         let inputs = try self.computeSwiftCompileCmdInputs(target)
@@ -217,7 +218,7 @@ extension LLBuildManifestBuilder {
         } else if buildParameters.emitSwiftModuleSeparately {
             try self.addSwiftCmdsEmitSwiftModuleSeparately(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
         } else {
-            try self.addCmdWithBuiltinSwiftTool(target, inputs: inputs, cmdOutputs: cmdOutputs)
+            try self.addCmdWithBuiltinSwiftTool(target, inputs: inputs, cmdOutputs: cmdOutputs, mixedTarget: mixedTarget)
         }
 
         if addTargetCmd {
@@ -525,7 +526,8 @@ extension LLBuildManifestBuilder {
     private func addCmdWithBuiltinSwiftTool(
         _ target: SwiftTargetBuildDescription,
         inputs: [Node],
-        cmdOutputs: [Node]
+        cmdOutputs: [Node],
+        mixedTarget: Bool = false
     ) throws {
         let isLibrary = target.target.type == .library || target.target.type == .test
         let cmdName = target.target.getCommandName(config: buildConfig)
@@ -533,7 +535,7 @@ extension LLBuildManifestBuilder {
         manifest.addSwiftCmd(
             name: cmdName,
             inputs: inputs,
-            outputs: cmdOutputs,
+            outputs: mixedTarget ? cmdOutputs.dropLast() : cmdOutputs,
             executable: buildParameters.toolchain.swiftCompilerPath,
             moduleName: target.target.c99name,
             moduleAliases: target.target.moduleAliases,
@@ -546,6 +548,30 @@ extension LLBuildManifestBuilder {
             isLibrary: isLibrary,
             wholeModuleOptimization: buildParameters.configuration == .release
         )
+
+        if mixedTarget {
+            // Add a successive command to built the underlying Objective-C
+            // module. I'm breaking it into a successive compile command because
+            //when I mix the `-emit-object-header` flag with the
+            // `-import-underlying-module`, the $(ModuleName)-Swift.h does not
+            // get created.
+            manifest.addSwiftCmd(
+                name: "\(cmdName)-2",
+                inputs: inputs,
+                outputs: [cmdOutputs.last!],
+                executable: buildParameters.toolchain.swiftCompilerPath,
+                moduleName: target.target.c99name,
+                moduleAliases: target.target.moduleAliases,
+                moduleOutputPath: target.moduleOutputPath,
+                importPath: buildParameters.buildPath,
+                tempsPath: target.tempsPath,
+                objects: target.objects,
+                otherArguments: try target.compileArguments() + ["-import-underlying-module"],
+                sources: target.sources,
+                isLibrary: isLibrary,
+                wholeModuleOptimization: buildParameters.configuration == .release
+            )
+        }
     }
 
     private func computeSwiftCompileCmdInputs(
@@ -854,7 +880,7 @@ extension LLBuildManifestBuilder {
         _ target: MixedTargetBuildDescription
     ) throws {
         let clangOutputs = try createClangCompileCommand(target.clangTargetBuildDescription, addTargetCmd: false)
-        let swiftOutputs = try createSwiftCompileCommand(target.swiftTargetBuildDescription, addTargetCmd: false)
+        let swiftOutputs = try createSwiftCompileCommand(target.swiftTargetBuildDescription, addTargetCmd: false, mixedTarget: true)
         self.addTargetCmd(target: target.target, isTestTarget: target.isTestTarget, inputs: clangOutputs + swiftOutputs)
     }
 }
