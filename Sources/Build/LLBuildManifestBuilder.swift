@@ -557,7 +557,7 @@ extension LLBuildManifestBuilder {
             moduleOutputPath: target.moduleOutputPath,
             importPath: buildParameters.buildPath,
             tempsPath: target.tempsPath,
-            objects: target.objects,
+            objects: try target.objects,
             otherArguments: otherArguments,
             sources: target.sources,
             isLibrary: isLibrary,
@@ -611,7 +611,7 @@ extension LLBuildManifestBuilder {
             case .mixed(let target)?:
                 inputs.append(file: target.swiftTargetBuildDescription.moduleOutputPath)
 
-                for object in target.clangTargetBuildDescription.objects {
+                for object in try target.clangTargetBuildDescription.objects {
                     inputs.append(file: object)
                 }
 
