@@ -211,7 +211,11 @@ extension LLBuildManifestBuilder {
         // Outputs.
         let objectNodes = try target.objects.map(Node.file)
         let moduleNode = Node.file(target.moduleOutputPath)
-        let cmdOutputs = objectNodes + [moduleNode]
+        var cmdOutputs = objectNodes + [moduleNode]
+
+        if mixedTarget {
+            cmdOutputs += [Node.file(target.objCompatibilityHeaderPath)]
+        }
 
         if buildParameters.useIntegratedSwiftDriver {
             try self.addSwiftCmdsViaIntegratedDriver(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
@@ -775,6 +779,15 @@ extension LLBuildManifestBuilder {
             inputs.append(resourcesNode)
         }
 
+        // If it's a mixed target, add the Objective-C compatibility header that
+        // the Swift half of the mixed target generates. This header acts as an
+        // input to the Clang compile command, which therefore forces the
+        // Swift half of the mixed target to be built first.
+        if mixedTarget {
+            // TODO(ncooke3): Maybe the header should be passed into this API?
+            inputs.append(Node.file(target.tempsPath.appending(component: "\(target.target.name)-Swift.h")))
+        }
+
         func addStaticTargetInputs(_ target: ResolvedTarget) {
             if case .swift(let desc)? = plan.targetMap[target], target.type == .library {
                 inputs.append(file: desc.moduleOutputPath)
@@ -877,9 +890,9 @@ extension LLBuildManifestBuilder {
     private func createMixedCompileCommand(
         _ target: MixedTargetBuildDescription
     ) throws {
-        let clangOutputs = try createClangCompileCommand(target.clangTargetBuildDescription, addTargetCmd: false, mixedTarget: true)
         let swiftOutputs = try createSwiftCompileCommand(target.swiftTargetBuildDescription, addTargetCmd: false, mixedTarget: true)
-        self.addTargetCmd(target: target.target, isTestTarget: target.isTestTarget, inputs: clangOutputs + swiftOutputs)
+        let clangOutputs = try createClangCompileCommand(target.clangTargetBuildDescription, addTargetCmd: false, mixedTarget: true)
+        self.addTargetCmd(target: target.target, isTestTarget: target.isTestTarget, inputs: swiftOutputs + clangOutputs)
     }
 }
 
