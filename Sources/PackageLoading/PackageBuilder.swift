@@ -857,7 +857,11 @@ public final class PackageBuilder {
         // TODO(ncooke3): Figure out if we should restrict Swift + Cxx.
         if sources.hasSwiftSources && sources.hasClangSources {
 
-            let moduleMapType = findModuleMapType(for: potentialModule, publicHeadersPath: publicHeadersPath)
+            let moduleMapType = try findModuleMapType(
+                for: potentialModule,
+                targetType: targetType,
+                publicHeadersPath: publicHeadersPath
+            )
 
             return try MixedTarget(
                 name: potentialModule.name,
@@ -894,7 +898,11 @@ public final class PackageBuilder {
         } else {
             // It's not a Mixed or Swift target, so it's a Clang target.
 
-            let moduleMapType = findModuleMapType(for: potentialModule, publicHeadersPath: publicHeadersPath)
+            let moduleMapType = try findModuleMapType(
+                for: potentialModule,
+                targetType: targetType,
+                publicHeadersPath: publicHeadersPath
+            )
 
             return try ClangTarget(
                 name: potentialModule.name,
@@ -1058,7 +1066,7 @@ public final class PackageBuilder {
     }
 
     /// Determines the type of module map that will be appropriate for a potential target based on its header layout.
-    private func findModuleMapType(for potentialModule: PotentialModule, publicHeadersPath: AbsolutePath) -> ModuleMapType {
+    private func findModuleMapType(for potentialModule: PotentialModule, targetType: Target.Kind,  publicHeadersPath: AbsolutePath) throws -> ModuleMapType {
         if fileSystem.exists(publicHeadersPath) {
             let moduleMapGenerator = ModuleMapGenerator(targetName: potentialModule.name, moduleName: potentialModule.name.spm_mangledToC99ExtendedIdentifier(), publicHeadersDir: publicHeadersPath, fileSystem: fileSystem)
             return moduleMapGenerator.determineModuleMapType(observabilityScope: self.observabilityScope)
