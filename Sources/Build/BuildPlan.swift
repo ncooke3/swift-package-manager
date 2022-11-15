@@ -1391,9 +1391,7 @@ public final class MixedTargetBuildDescription {
             isWithinMixedTarget: true
         )
 
-        // TODO(ncooke3): Can the below conditional be refined? The Clang build
-        // description only builds a module map for `.library` targets.
-        if target.type != .test {
+        if target.type == .library {
             // Compiling the mixed target will require a Clang VFS overlay file
             // with mappings to the target's module map and public headers.
             let publicHeadersPath = clangTargetBuildDescription.clangTarget.includeDir
@@ -1470,7 +1468,7 @@ public final class MixedTargetBuildDescription {
                 "-Xcc",
                 "-ivfsoverlay",
                 "-Xcc",
-                "\(buildArtifactDirectory)/unextended-module-overlay.yaml",
+                unextendedModuleMapOverlayPath.pathString
             ]
 
             clangTargetBuildDescription.additionalFlags += [
