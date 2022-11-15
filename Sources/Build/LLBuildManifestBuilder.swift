@@ -210,13 +210,18 @@ extension LLBuildManifestBuilder {
         // Outputs.
         let objectNodes = try target.objects.map(Node.file)
         let moduleNode = Node.file(target.moduleOutputPath)
-        var cmdOutputs = objectNodes + [moduleNode]
+        let cmdOutputs = objectNodes + [moduleNode]
 
+        // TODO(ncooke3): Do we need to support building mixed targets with the
+        // `--use-integrated-swiftdriver` or `--emit-swift-module-separately`
+        // flags?
         if target.isWithinMixedTarget {
-            cmdOutputs += [Node.file(target.objCompatibilityHeaderPath)]
-        }
-
-        if buildParameters.useIntegratedSwiftDriver {
+            try self.addCmdWithBuiltinSwiftTool(
+                target,
+                inputs: inputs,
+                cmdOutputs: cmdOutputs + [.file(target.objCompatibilityHeaderPath)]
+            )
+        } else if buildParameters.useIntegratedSwiftDriver {
             try self.addSwiftCmdsViaIntegratedDriver(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
         } else if buildParameters.emitSwiftModuleSeparately {
             try self.addSwiftCmdsEmitSwiftModuleSeparately(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
