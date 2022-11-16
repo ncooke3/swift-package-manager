@@ -1394,6 +1394,10 @@ public final class MixedTargetBuildDescription {
             throw InternalError("underlying target type mismatch \(target)")
         }
 
+        guard buildParameters.triple.isDarwin() else {
+            throw StringError("Mixed language targets are only supported on Apple platforms.")
+        }
+
         self.target = target
         self.fileSystem = fileSystem
 
