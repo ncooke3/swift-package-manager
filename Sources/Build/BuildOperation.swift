@@ -131,24 +131,24 @@ public final class BuildOperation: PackageStructureDelegate, SPMBuildCore.BuildS
     /// and the package structure hasn't changed.
     public func getBuildDescription() throws -> BuildDescription {
         return try self.buildDescription.memoize {
-//            if self.cacheBuildManifest {
-//                do {
-//                    // if buildPackageStructure returns a valid description we use that, otherwise we perform full planning
-//                    if try self.buildPackageStructure() {
-//                        // confirm the step above created the build description as expected
-//                        // we trust it to update the build description when needed
-//                        let buildDescriptionPath = self.buildParameters.buildDescriptionPath
-//                        guard self.fileSystem.exists(buildDescriptionPath) else {
-//                            throw InternalError("could not find build descriptor at \(buildDescriptionPath)")
-//                        }
-//                        // return the build description that's on disk.
-//                        return try BuildDescription.load(fileSystem: self.fileSystem, path: buildDescriptionPath)
-//                    }
-//                } catch {
-//                    // since caching is an optimization, warn about failing to load the cached version
-//                    self.observabilityScope.emit(warning: "failed to load the cached build description: \(error)")
-//                }
-//            }
+            if self.cacheBuildManifest {
+                do {
+                    // if buildPackageStructure returns a valid description we use that, otherwise we perform full planning
+                    if try self.buildPackageStructure() {
+                        // confirm the step above created the build description as expected
+                        // we trust it to update the build description when needed
+                        let buildDescriptionPath = self.buildParameters.buildDescriptionPath
+                        guard self.fileSystem.exists(buildDescriptionPath) else {
+                            throw InternalError("could not find build descriptor at \(buildDescriptionPath)")
+                        }
+                        // return the build description that's on disk.
+                        return try BuildDescription.load(fileSystem: self.fileSystem, path: buildDescriptionPath)
+                    }
+                } catch {
+                    // since caching is an optimization, warn about failing to load the cached version
+                    self.observabilityScope.emit(warning: "failed to load the cached build description: \(error)")
+                }
+            }
             // We need to perform actual planning if we reach here.
             return try self.plan().description
         }
