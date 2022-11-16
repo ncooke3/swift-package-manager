@@ -1447,10 +1447,6 @@ extension Sources {
         }
     }
 
-    var containsMixedLanguage: Bool {
-        return hasSwiftSources && hasClangSources
-    }
-
     /// Determine target type based on the sources.
     fileprivate func computeTargetType() -> Target.Kind {
         let isLibrary = !relativePaths.contains { path in
