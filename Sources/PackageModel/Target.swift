@@ -638,6 +638,7 @@ public final class MixedTarget: Target {
 
         self.clangTarget = try ClangTarget(
             name: name,
+            potentialBundleName: potentialBundleName,
             cLanguageStandard: cLanguageStandard,
             cxxLanguageStandard: cxxLanguageStandard,
             includeDir: includeDir,
@@ -645,7 +646,11 @@ public final class MixedTarget: Target {
             headers: headers,
             type: type,
             path: path,
-            sources: clangSources
+            sources: clangSources,
+            resources: resources,
+            ignored: ignored,
+            others: others,
+            buildSettings: buildSettings
         )
 
         super.init(
