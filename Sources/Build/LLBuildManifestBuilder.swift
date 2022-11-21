@@ -83,6 +83,8 @@ public class LLBuildManifestBuilder {
                         try self.createSwiftCompileCommand(desc)
                     case .clang(let desc):
                         try self.createClangCompileCommand(desc)
+                    case .mixed(let desc):
+                        try self.createMixedCompileCommand(desc)
                 }
             }
         }
@@ -193,13 +195,15 @@ extension LLBuildManifestBuilder {
     }
 }
 
-// MARK:- Compile Swift
+// MARK: - Compile Swift
 
 extension LLBuildManifestBuilder {
-    /// Create a llbuild target for a Swift target description.
+    /// Create a llbuild target for a Swift target description and returns the Swift targets outputs.
+    @discardableResult
     private func createSwiftCompileCommand(
-        _ target: SwiftTargetBuildDescription
-    ) throws {
+        _ target: SwiftTargetBuildDescription,
+        addTargetCmd: Bool = true
+    ) throws -> [Node] {
         // Inputs.
         let inputs = try self.computeSwiftCompileCmdInputs(target)
 
@@ -208,7 +212,16 @@ extension LLBuildManifestBuilder {
         let moduleNode = Node.file(target.moduleOutputPath)
         let cmdOutputs = objectNodes + [moduleNode]
 
-        if buildParameters.useIntegratedSwiftDriver {
+        // TODO(ncooke3): Do we need to support building mixed targets with the
+        // `--use-integrated-swiftdriver` or `--emit-swift-module-separately`
+        // flags?
+        if target.isWithinMixedTarget {
+            try self.addCmdWithBuiltinSwiftTool(
+                target,
+                inputs: inputs,
+                cmdOutputs: cmdOutputs + [.file(target.objCompatibilityHeaderPath)]
+            )
+        } else if buildParameters.useIntegratedSwiftDriver {
             try self.addSwiftCmdsViaIntegratedDriver(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
         } else if buildParameters.emitSwiftModuleSeparately {
             try self.addSwiftCmdsEmitSwiftModuleSeparately(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
@@ -216,8 +229,16 @@ extension LLBuildManifestBuilder {
             try self.addCmdWithBuiltinSwiftTool(target, inputs: inputs, cmdOutputs: cmdOutputs)
         }
 
-        self.addTargetCmd(target, cmdOutputs: cmdOutputs)
+        if addTargetCmd {
+            self.addTargetCmd(
+                target: target.target,
+                isTestTarget: target.isTestTarget,
+                inputs: cmdOutputs
+            )
+        }
         try self.addModuleWrapCmd(target)
+
+        return cmdOutputs
     }
 
     private func addSwiftCmdsViaIntegratedDriver(
@@ -379,6 +400,9 @@ extension LLBuildManifestBuilder {
                                                                      explicitDependencyJobTracker: explicitDependencyJobTracker)
                 case .clang(let desc):
                     try self.createClangCompileCommand(desc)
+
+                case .mixed(let desc):
+                    try self.createMixedCompileCommand(desc)
             }
         }
     }
@@ -401,7 +425,11 @@ extension LLBuildManifestBuilder {
                                       dependencyOracle: dependencyOracle,
                                       explicitDependencyJobTracker: explicitDependencyJobTracker)
 
-        self.addTargetCmd(description, cmdOutputs: cmdOutputs)
+        self.addTargetCmd(
+            target: description.target,
+            isTestTarget: description.isTestTarget,
+            inputs: cmdOutputs
+        )
         try self.addModuleWrapCmd(description)
     }
 
@@ -572,6 +600,13 @@ extension LLBuildManifestBuilder {
                 for object in try target.objects {
                     inputs.append(file: object)
                 }
+            case .mixed(let target)?:
+                inputs.append(file: target.swiftTargetBuildDescription.moduleOutputPath)
+
+                for object in try target.clangTargetBuildDescription.objects {
+                    inputs.append(file: object)
+                }
+
             case nil:
                 throw InternalError("unexpected: target \(target) not in target map \(plan.targetMap)")
             }
@@ -639,19 +674,23 @@ extension LLBuildManifestBuilder {
     }
 
     /// Adds a top-level phony command that builds the entire target.
-    private func addTargetCmd(_ target: SwiftTargetBuildDescription, cmdOutputs: [Node]) {
+    private func addTargetCmd(
+        target: ResolvedTarget,
+        isTestTarget: Bool,
+        inputs: [Node]
+    ) {
         // Create a phony node to represent the entire target.
-        let targetName = target.target.getLLBuildTargetName(config: buildConfig)
+        let targetName = target.getLLBuildTargetName(config: buildConfig)
         let targetOutput: Node = .virtual(targetName)
 
         manifest.addNode(targetOutput, toTarget: targetName)
         manifest.addPhonyCmd(
             name: targetOutput.name,
-            inputs: cmdOutputs,
+            inputs: inputs,
             outputs: [targetOutput]
         )
-        if plan.graph.isInRootPackages(target.target, satisfying: self.buildEnvironment) {
-            if !target.isTestTarget {
+        if plan.graph.isInRootPackages(target, satisfying: self.buildEnvironment) {
+            if !isTestTarget {
                 addNode(targetOutput, toTarget: .main)
             }
             addNode(targetOutput, toTarget: .test)
@@ -706,10 +745,13 @@ fileprivate class UniqueExplicitDependencyJobTracker {
 // MARK:- Compile C-family
 
 extension LLBuildManifestBuilder {
-    /// Create a llbuild target for a Clang target description.
+    /// Create a llbuild target for a Clang target description and returns the Clang target's outputs.
+    @discardableResult
     private func createClangCompileCommand(
-        _ target: ClangTargetBuildDescription
-    ) throws {
+        _ target: ClangTargetBuildDescription,
+        addTargetCmd: Bool = true,
+        createResourceBundle: Bool = true
+    ) throws -> [Node] {
         let standards = [
             (target.clangTarget.cxxLanguageStandard, SupportedLanguageExtension.cppExtensions),
             (target.clangTarget.cLanguageStandard, SupportedLanguageExtension.cExtensions),
@@ -717,17 +759,29 @@ extension LLBuildManifestBuilder {
 
         var inputs: [Node] = []
 
-        // Add resources node as the input to the target. This isn't great because we
-        // don't need to block building of a module until its resources are assembled but
-        // we don't currently have a good way to express that resources should be built
-        // whenever a module is being built.
-        if let resourcesNode = createResourcesBundle(for: .clang(target)) {
-            inputs.append(resourcesNode)
+        if createResourceBundle {
+            // Add resources node as the input to the target. This isn't great because we
+            // don't need to block building of a module until its resources are assembled but
+            // we don't currently have a good way to express that resources should be built
+            // whenever a module is being built.
+            if let resourcesNode = createResourcesBundle(for: .clang(target)) {
+                inputs.append(resourcesNode)
+            }
+        }
+
+        // If it's a mixed target, add the Objective-C compatibility header that
+        // the Swift half of the mixed target generates. This header acts as an
+        // input to the Clang compile command, which therefore forces the
+        // Swift half of the mixed target to be built first.
+        if target.isWithinMixedTarget {
+            inputs.append(Node.file(target.tempsPath.appending(component: "\(target.target.name)-Swift.h")))
         }
 
         func addStaticTargetInputs(_ target: ResolvedTarget) {
             if case .swift(let desc)? = plan.targetMap[target], target.type == .library {
                 inputs.append(file: desc.moduleOutputPath)
+            } else if case .mixed(let desc)? = plan.targetMap[target], target.type == .library {
+                inputs.append(file: desc.swiftTargetBuildDescription.moduleOutputPath)
             }
         }
 
@@ -769,7 +823,9 @@ extension LLBuildManifestBuilder {
 
         for path in try target.compilePaths() {
             let isCXX = path.source.extension.map{ SupportedLanguageExtension.cppExtensions.contains($0) } ?? false
-            var args = try target.basicArguments(isCXX: isCXX)
+            let isC = path.source.extension.map { $0 == SupportedLanguageExtension.c.rawValue } ?? false
+
+            var args = try target.basicArguments(isCXX: isCXX, isC: isC)
 
             args += ["-MD", "-MT", "dependencies", "-MF", path.deps.pathString]
 
@@ -800,23 +856,33 @@ extension LLBuildManifestBuilder {
             )
         }
 
-        // Create a phony node to represent the entire target.
-        let targetName = target.target.getLLBuildTargetName(config: buildConfig)
-        let output: Node = .virtual(targetName)
-
-        manifest.addNode(output, toTarget: targetName)
-        manifest.addPhonyCmd(
-            name: output.name,
-            inputs: objectFileNodes,
-            outputs: [output]
-        )
-
-        if plan.graph.isInRootPackages(target.target, satisfying: self.buildEnvironment) {
-            if !target.isTestTarget {
-                addNode(output, toTarget: .main)
-            }
-            addNode(output, toTarget: .test)
+        if addTargetCmd {
+            self.addTargetCmd(
+                target: target.target,
+                isTestTarget: target.isTestTarget,
+                inputs: objectFileNodes
+            )
         }
+
+        return objectFileNodes
+    }
+}
+
+// MARK: - Compile Mixed Languages
+
+extension LLBuildManifestBuilder {
+    /// Create a llbuild target for a mixed target description.
+    private func createMixedCompileCommand(
+        _ target: MixedTargetBuildDescription
+    ) throws {
+        let swiftOutputs = try createSwiftCompileCommand(target.swiftTargetBuildDescription, addTargetCmd: false)
+        let clangOutputs = try createClangCompileCommand(
+            target.clangTargetBuildDescription,
+            addTargetCmd: false,
+            // The Swift compile command already created the resource bundle.
+            createResourceBundle: false
+        )
+        self.addTargetCmd(target: target.target, isTestTarget: target.isTestTarget, inputs: swiftOutputs + clangOutputs)
     }
 }
 

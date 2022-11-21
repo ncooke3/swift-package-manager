@@ -166,6 +166,9 @@ public enum TargetBuildDescription {
     /// Clang target description.
     case clang(ClangTargetBuildDescription)
 
+    /// Mixed (Swift + Clang) target description.
+    case mixed(MixedTargetBuildDescription)
+
     /// The objects in this target.
     var objects: [AbsolutePath] {
         get throws {
@@ -173,6 +176,8 @@ public enum TargetBuildDescription {
             case .swift(let target):
                 return try target.objects
             case .clang(let target):
+                return try target.objects
+            case .mixed(let target):
                 return try target.objects
             }
         }
@@ -186,6 +191,8 @@ public enum TargetBuildDescription {
         case .clang(let target):
             // TODO: Clang targets should support generated resources in the future.
             return target.target.underlyingTarget.resources
+        case .mixed(let target):
+            return target.resources
         }
     }
 
@@ -196,6 +203,8 @@ public enum TargetBuildDescription {
             return target.bundlePath
         case .clang(let target):
             return target.bundlePath
+        case .mixed(let target):
+            return target.bundlePath
         }
     }
 
@@ -204,6 +213,8 @@ public enum TargetBuildDescription {
         case .swift(let target):
             return target.target
         case .clang(let target):
+            return target.target
+        case .mixed(let target):
             return target.target
         }
     }
@@ -215,6 +226,8 @@ public enum TargetBuildDescription {
             return target.libraryBinaryPaths
         case .clang(let target):
             return target.libraryBinaryPaths
+        case .mixed(let target):
+            return target.libraryBinaryPaths
         }
     }
 
@@ -223,6 +236,8 @@ public enum TargetBuildDescription {
         case .swift(let target):
             return target.resourceBundleInfoPlistPath
         case .clang(let target):
+            return target.resourceBundleInfoPlistPath
+        case .mixed(let target):
             return target.resourceBundleInfoPlistPath
         }
     }
@@ -290,13 +305,18 @@ public final class ClangTargetBuildDescription {
     /// The filesystem to operate on.
     private let fileSystem: FileSystem
 
+    /// Whether or not the target belongs to a mixed language target.
+    ///
+    /// Mixed language targets consist of an underlying Swift and Clang target.
+    let isWithinMixedTarget: Bool
+
     /// If this target is a test target.
     public var isTestTarget: Bool {
         return target.type == .test
     }
 
     /// Create a new target description with target and build parameters.
-    init(target: ResolvedTarget, toolsVersion: ToolsVersion, buildParameters: BuildParameters, fileSystem: FileSystem) throws {
+    init(target: ResolvedTarget, toolsVersion: ToolsVersion, buildParameters: BuildParameters, fileSystem: FileSystem, isWithinMixedTarget: Bool = false) throws {
         guard target.underlyingTarget is ClangTarget else {
             throw InternalError("underlying target type mismatch \(target)")
         }
@@ -307,6 +327,7 @@ public final class ClangTargetBuildDescription {
         self.buildParameters = buildParameters
         self.tempsPath = buildParameters.buildPath.appending(component: target.c99name + ".build")
         self.derivedSources = Sources(paths: [], root: tempsPath.appending(component: "DerivedSources"))
+        self.isWithinMixedTarget = isWithinMixedTarget
 
         // Try computing modulemap path for a C library.  This also creates the file in the file system, if needed.
         if target.type == .library {
@@ -316,10 +337,40 @@ public final class ClangTargetBuildDescription {
             }
             // If a generated module map is needed, generate one now in our temporary directory.
             else if let generatedModuleMapType = clangTarget.moduleMapType.generatedModuleMapType {
-                let path = tempsPath.appending(component: moduleMapFilename)
-                let moduleMapGenerator = ModuleMapGenerator(targetName: clangTarget.name, moduleName: clangTarget.c99name, publicHeadersDir: clangTarget.includeDir, fileSystem: fileSystem)
-                try moduleMapGenerator.generateModuleMap(type: generatedModuleMapType, at: path)
-                self.moduleMap = path
+                let moduleMapGenerator = ModuleMapGenerator(
+                    targetName: clangTarget.name,
+                    moduleName: clangTarget.c99name,
+                    publicHeadersDir: clangTarget.includeDir,
+                    fileSystem: fileSystem
+                )
+
+                let generatedInteropHeaderPath = isWithinMixedTarget
+                    ? tempsPath.appending(component: "\(target.c99name)-Swift.h") : nil
+
+                let moduleMapPath = tempsPath.appending(component: moduleMapFilename)
+                try moduleMapGenerator.generateModuleMap(
+                    type: generatedModuleMapType,
+                    at: moduleMapPath,
+                    interopHeaderPath: generatedInteropHeaderPath
+                )
+
+                if isWithinMixedTarget {
+                    // The underlying Clang target is building within a Mixed
+                    // language target and needs an auxiliary module map that
+                    // doesn't include the generated interop header from the
+                    // Swift half of the mixed target. This will later allow the
+                    // Clang half of the module to be built when compiling the
+                    // Swift part without the generated header being considered
+                    // an input (because it won't exist yet and is an output of
+                    // that compilation command).
+                    let unextendedModuleMapPath = tempsPath.appending(component: unextendedModuleMapFilename)
+                    try moduleMapGenerator.generateModuleMap(
+                        type: generatedModuleMapType,
+                        at: unextendedModuleMapPath
+                    )
+                }
+
+                self.moduleMap = moduleMapPath
             }
             // Otherwise there is no module map, and we leave `moduleMap` unset.
         }
@@ -356,7 +407,10 @@ public final class ClangTargetBuildDescription {
 
     /// Builds up basic compilation arguments for a source file in this target; these arguments may be different for C++ vs non-C++.
     /// NOTE: The parameter to specify whether to get C++ semantics is currently optional, but this is only for revlock avoidance with clients. Callers should always specify what they want based either the user's indication or on a default value (possibly based on the filename suffix).
-    public func basicArguments(isCXX isCXXOverride: Bool? = .none) throws -> [String] {
+    public func basicArguments(
+        isCXX isCXXOverride: Bool? = .none,
+        isC isCOverride: Bool = false
+    ) throws -> [String] {
         // For now fall back on the hold semantics if the C++ nature isn't specified. This is temporary until clients have been updated.
         let isCXX = isCXXOverride ?? clangTarget.isCXX
 
@@ -419,7 +473,10 @@ public final class ClangTargetBuildDescription {
         // Add arguments from declared build settings.
         args += try self.buildSettingsFlags()
 
-        if let resourceAccessorHeaderFile = self.resourceAccessorHeaderFile {
+        // Include the path to the resource header unless the arguments are
+        // being evaluated for a C file. A C file cannot depend on the resource
+        // accessor header due to it exporting a Foundation type (`NSBundle`).
+        if let resourceAccessorHeaderFile = self.resourceAccessorHeaderFile, !isCOverride {
             args += ["-include", resourceAccessorHeaderFile.pathString]
         }
 
@@ -503,7 +560,13 @@ public final class ClangTargetBuildDescription {
 
         NSBundle* \(target.c99name)_SWIFTPM_MODULE_BUNDLE() {
             NSURL *bundleURL = [[[NSBundle mainBundle] bundleURL] URLByAppendingPathComponent:@"\(bundleBasename)"];
-            return [NSBundle bundleWithURL:bundleURL];
+
+            NSBundle *preferredBundle = [NSBundle bundleWithURL:bundleURL];
+            if (preferredBundle == nil) {
+              return [NSBundle bundleWithPath:@"\(bundlePath.pathString)"];
+            }
+
+            return preferredBundle;
         }
         """
 
@@ -633,6 +696,11 @@ public final class SwiftTargetBuildDescription {
     /// Any addition flags to be added. These flags are expected to be computed during build planning.
     fileprivate var additionalFlags: [String] = []
 
+    /// Whether or not the target belongs to a mixed language target.
+    ///
+    /// Mixed language targets consist of an underlying Swift and Clang target.
+    let isWithinMixedTarget: Bool
+
     /// The swift version for this target.
     var swiftVersion: SwiftLanguageVersion {
         return (target.underlyingTarget as! SwiftTarget).swiftVersion
@@ -739,7 +807,8 @@ public final class SwiftTargetBuildDescription {
         prebuildCommandResults: [PrebuildCommandResult] = [],
         testTargetRole: TestTargetRole? = nil,
         fileSystem: FileSystem,
-        observabilityScope: ObservabilityScope
+        observabilityScope: ObservabilityScope,
+        isWithinMixedTarget: Bool = false
     ) throws {
         guard target.underlyingTarget is SwiftTarget else {
             throw InternalError("underlying target type mismatch \(target)")
@@ -763,6 +832,7 @@ public final class SwiftTargetBuildDescription {
         self.buildToolPluginInvocationResults = buildToolPluginInvocationResults
         self.prebuildCommandResults = prebuildCommandResults
         self.observabilityScope = observabilityScope
+        self.isWithinMixedTarget = isWithinMixedTarget
 
         // Add any derived files that were declared for any commands from plugin invocations.
         var pluginDerivedFiles = [AbsolutePath]()
@@ -787,7 +857,10 @@ public final class SwiftTargetBuildDescription {
             self.pluginDerivedSources.relativePaths.append(relPath)
         }
 
-        if shouldEmitObjCCompatibilityHeader {
+        // If building for a mixed target, the Objective-C portion of the build
+        // description will create the module map and include the Swift
+        // interoptability header.
+        if shouldEmitObjCCompatibilityHeader && !isWithinMixedTarget {
             self.moduleMap = try self.generateModuleMap()
         }
 
@@ -1085,6 +1158,13 @@ public final class SwiftTargetBuildDescription {
         return result
     }
 
+    func appendClangFlags(_ flags: String...) {
+        flags.forEach { flag in
+            additionalFlags.append("-Xcc")
+            additionalFlags.append(flag)
+        }
+    }
+
     /// Returns true if ObjC compatibility header should be emitted.
     private var shouldEmitObjCCompatibilityHeader: Bool {
         return buildParameters.triple.isDarwin() && target.type == .library
@@ -1247,6 +1327,196 @@ public final class SwiftTargetBuildDescription {
             return ["-static-stdlib"]
         } else {
             return []
+        }
+    }
+}
+
+public final class MixedTargetBuildDescription {
+
+    /// The target described by this target.
+    let target: ResolvedTarget
+
+    /// The list of all resource files in the target.
+    var resources: [Resource] { target.underlyingTarget.resources }
+
+    /// If this target is a test target.
+    var isTestTarget: Bool {
+        clangTargetBuildDescription.isTestTarget &&
+            swiftTargetBuildDescription.isTestTarget
+    }
+
+    /// The objects in this target. This includes both the Swift and Clang object files.
+    var objects: [AbsolutePath] {
+        get throws {
+            try swiftTargetBuildDescription.objects +
+                clangTargetBuildDescription.objects
+        }
+    }
+
+    /// Path to the bundle generated for this module (if any).
+    var bundlePath: AbsolutePath? { swiftTargetBuildDescription.bundlePath }
+
+    /// Path to the resource Info.plist file, if generated.
+    var resourceBundleInfoPlistPath: AbsolutePath? {
+        swiftTargetBuildDescription.resourceBundleInfoPlistPath
+    }
+
+    /// The modulemap file for this target, if any
+    var moduleMap: AbsolutePath? { clangTargetBuildDescription.moduleMap }
+
+    /// Paths to the binary libraries the target depends on.
+    var libraryBinaryPaths: Set<AbsolutePath> {
+        swiftTargetBuildDescription.libraryBinaryPaths
+            .union(clangTargetBuildDescription.libraryBinaryPaths)
+    }
+
+    /// The build description for the Clang sources.
+    let clangTargetBuildDescription: ClangTargetBuildDescription
+
+    /// The build description for the Swift sources.
+    let swiftTargetBuildDescription: SwiftTargetBuildDescription
+
+    private let fileSystem: FileSystem
+
+    init(
+        package: ResolvedPackage,
+        target: ResolvedTarget,
+        toolsVersion: ToolsVersion,
+        additionalFileRules: [FileRuleDescription] = [],
+        buildParameters: BuildParameters,
+        buildToolPluginInvocationResults: [BuildToolPluginInvocationResult] = [],
+        prebuildCommandResults: [PrebuildCommandResult] = [],
+        fileSystem: FileSystem,
+        observabilityScope: ObservabilityScope
+    ) throws {
+        guard let mixedTarget = target.underlyingTarget as? MixedTarget else {
+            throw InternalError("underlying target type mismatch \(target)")
+        }
+
+        guard buildParameters.triple.isDarwin() else {
+            throw StringError("Targets with mixed language sources are only " +
+                              "supported on Apple platforms.")
+        }
+
+        self.target = target
+        self.fileSystem = fileSystem
+
+        let clangResolvedTarget = ResolvedTarget(
+            target: mixedTarget.clangTarget,
+            dependencies: target.dependencies,
+            defaultLocalization: target.defaultLocalization,
+            platforms: target.platforms
+        )
+        self.clangTargetBuildDescription = try ClangTargetBuildDescription(
+            target: clangResolvedTarget,
+            toolsVersion: toolsVersion,
+            buildParameters: buildParameters,
+            fileSystem: fileSystem,
+            isWithinMixedTarget: true
+        )
+
+        let swiftResolvedTarget = ResolvedTarget(
+            target: mixedTarget.swiftTarget,
+            dependencies: target.dependencies,
+            defaultLocalization: target.defaultLocalization,
+            platforms: target.platforms
+        )
+        self.swiftTargetBuildDescription = try SwiftTargetBuildDescription(
+            package: package,
+            target: swiftResolvedTarget,
+            toolsVersion: toolsVersion,
+            additionalFileRules: additionalFileRules,
+            buildParameters: buildParameters,
+            buildToolPluginInvocationResults: buildToolPluginInvocationResults,
+            prebuildCommandResults: prebuildCommandResults,
+            fileSystem: fileSystem,
+            observabilityScope: observabilityScope,
+            isWithinMixedTarget: true
+        )
+
+        if target.type == .library {
+            // Compiling the mixed target will require a Clang VFS overlay file
+            // with mappings to the target's module map and public headers.
+            let publicHeadersPath = clangTargetBuildDescription.clangTarget.includeDir
+            let buildArtifactDirectory = swiftTargetBuildDescription.tempsPath
+            let generatedInteropHeaderPath = swiftTargetBuildDescription.objCompatibilityHeaderPath
+            let allProductHeadersPath = buildArtifactDirectory
+                .appending(component: "all-product-headers.yaml")
+
+            // The auxilliary module map is passed to the Clang compiler
+            // via a VFS overlay, represented by the below YAML file.
+            let unextendedModuleMapOverlayPath = buildArtifactDirectory
+                .appending(component: "unextended-module-overlay.yaml")
+            try VFSOverlay(roots: [
+                VFSOverlay.Directory(
+                    name: buildArtifactDirectory.pathString,
+                    contents: [
+                        VFSOverlay.File(
+                            name: moduleMapFilename,
+                            externalContents:
+                                buildArtifactDirectory.appending(component: unextendedModuleMapFilename).pathString
+                        )
+                    ]
+                )
+            ]).write(to: unextendedModuleMapOverlayPath, fileSystem: fileSystem)
+
+            try VFSOverlay(roots: [
+                VFSOverlay.Directory(
+                    name: publicHeadersPath.pathString,
+                    contents:
+                        // Public headers
+                        try Set(fileSystem.getDirectoryContents(publicHeadersPath)
+                                .map(publicHeadersPath.appending(component:)))
+                                .filter(publicHeadersPath.isAncestor(of:))
+                                .map { headerPath in
+                                    VFSOverlay.File(
+                                        name: headerPath.basename,
+                                        externalContents: headerPath.pathString
+                                    )
+                                }
+                ),
+                VFSOverlay.Directory(
+                    name: buildArtifactDirectory.pathString,
+                    contents: [
+                        // Module map
+                        VFSOverlay.File(
+                            name: moduleMapFilename,
+                            externalContents:
+                                buildArtifactDirectory.appending(component: moduleMapFilename).pathString
+                        )
+                    ]
+                ),
+                VFSOverlay.Directory(
+                    name: buildArtifactDirectory.pathString,
+                    contents: [
+                        // Generated $(ModuleName)-Swift.h header
+                        VFSOverlay.File(
+                            name: generatedInteropHeaderPath.basename,
+                            externalContents: generatedInteropHeaderPath.pathString
+                        )
+                    ]
+                ),
+            ]).write(to: allProductHeadersPath, fileSystem: fileSystem)
+
+            swiftTargetBuildDescription.additionalFlags.append(
+                // Builds Objective-C portion of module.
+                "-import-underlying-module"
+            )
+
+            swiftTargetBuildDescription.appendClangFlags(
+                // Pass VFS overlay to the underlying Clang compiler.
+                "-ivfsoverlay", allProductHeadersPath.pathString,
+                // Pass VFS overlay to the underlying Clang compiler.
+                "-ivfsoverlay", unextendedModuleMapOverlayPath.pathString
+            )
+
+            // For mixed targets, the Swift half of the target will generate
+            // an Objective-C compatibility header in the build folder.
+            // Compiling the Objective-C half of the target may require this
+            // generated header if the Objective-C half uses any APIs from
+            // the Swift half. For successful compilation, the directory
+            // with the generated header is added as a header search path.
+            clangTargetBuildDescription.additionalFlags.append("-I\(buildArtifactDirectory)")
         }
     }
 }
@@ -1928,6 +2198,17 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
                     toolsVersion: toolsVersion,
                     buildParameters: buildParameters,
                     fileSystem: fileSystem))
+            case is MixedTarget:
+                guard let package = graph.package(for: target) else {
+                    throw InternalError("package not found for \(target)")
+                }
+                targetMap[target] = try .mixed(MixedTargetBuildDescription(
+                    package: package,
+                    target: target,
+                    toolsVersion: toolsVersion,
+                    buildParameters: buildParameters,
+                    fileSystem: fileSystem,
+                    observabilityScope: observabilityScope))
             case is PluginTarget:
                 guard let package = graph.package(for: target) else {
                     throw InternalError("package not found for \(target)")
@@ -2035,6 +2316,8 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
                 try self.plan(swiftTarget: target)
             case .clang(let target):
                 try self.plan(clangTarget: target)
+            case .mixed(let target):
+                try self.plan(mixedTarget: target)
             }
         }
 
@@ -2265,6 +2548,13 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
                         clangTarget.additionalFlags += ["-fmodule-map-file=\(moduleMap.pathString)"]
                     }
                 }
+            case let target as MixedTarget where target.type == .library:
+                // Add the modulemap of the dependency if it has one.
+                if case let .mixed(dependencyTargetDescription)? = targetMap[dependency] {
+                    if let moduleMap = dependencyTargetDescription.moduleMap {
+                        clangTarget.additionalFlags += ["-fmodule-map-file=\(moduleMap.pathString)"]
+                    }
+                }
             case let target as SystemLibraryTarget:
                 clangTarget.additionalFlags += ["-fmodule-map-file=\(target.moduleMapPath.pathString)"]
                 clangTarget.additionalFlags += try pkgConfig(for: target).cFlags
@@ -2298,10 +2588,11 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
                 // one. However, in that case it will not be importable in Swift targets. We may want to emit a warning
                 // in that case from here.
                 guard let moduleMap = target.moduleMap else { break }
-                swiftTarget.additionalFlags += [
-                    "-Xcc", "-fmodule-map-file=\(moduleMap.pathString)",
-                    "-Xcc", "-I", "-Xcc", target.clangTarget.includeDir.pathString,
-                ]
+                swiftTarget.appendClangFlags(
+                    "-fmodule-map-file=\(moduleMap.pathString)",
+                    "-I",
+                    target.clangTarget.includeDir.pathString
+                )
             case let target as SystemLibraryTarget:
                 swiftTarget.additionalFlags += ["-Xcc", "-fmodule-map-file=\(target.moduleMapPath.pathString)"]
                 swiftTarget.additionalFlags += try pkgConfig(for: target).cFlags
@@ -2315,10 +2606,29 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
                         swiftTarget.libraryBinaryPaths.insert(library.libraryPath)
                     }
                 }
+            case let underlyingTarget as MixedTarget where underlyingTarget.type == .library:
+                guard case let .mixed(target)? = targetMap[dependency] else {
+                    throw InternalError("unexpected mixed target \(underlyingTarget)")
+                }
+                // Add the path to modulemap of the dependency. Currently we
+                // require that all Mixed targets have a modulemap as it is
+                // required for interoperability.
+                guard let moduleMap = target.moduleMap else { break }
+                swiftTarget.appendClangFlags(
+                    "-fmodule-map-file=\(moduleMap.pathString)",
+                    "-I",
+                    target.clangTargetBuildDescription.clangTarget.includeDir.pathString
+                )
             default:
                 break
             }
         }
+    }
+
+    /// Plan a Mixed target.
+    private func plan(mixedTarget: MixedTargetBuildDescription) throws {
+        try plan(swiftTarget: mixedTarget.swiftTargetBuildDescription)
+        try plan(clangTarget: mixedTarget.clangTargetBuildDescription)
     }
 
     public func createAPIToolCommonArgs(includeLibrarySearchPaths: Bool) throws -> [String] {
@@ -2343,6 +2653,10 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
             switch target {
             case .swift: break
             case .clang(let targetDescription):
+                if let includeDir = targetDescription.moduleMap?.parentDirectory {
+                    arguments += ["-I", includeDir.pathString]
+                }
+            case .mixed(let targetDescription):
                 if let includeDir = targetDescription.moduleMap?.parentDirectory {
                     arguments += ["-I", includeDir.pathString]
                 }
@@ -2379,6 +2693,10 @@ public class BuildPlan: SPMBuildCore.BuildPlan {
             switch target {
                 case .swift: break
             case .clang(let targetDescription):
+                if let includeDir = targetDescription.moduleMap?.parentDirectory {
+                    arguments += ["-I\(includeDir.pathString)"]
+                }
+            case .mixed(let targetDescription):
                 if let includeDir = targetDescription.moduleMap?.parentDirectory {
                     arguments += ["-I\(includeDir.pathString)"]
                 }

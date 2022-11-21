@@ -18,6 +18,9 @@ import TSCBasic
 /// Name of the module map file recognized by the Clang and Swift compilers.
 public let moduleMapFilename = "module.modulemap"
 
+/// Name of the auxilliary module map file used in the Clang VFS overlay sytem.
+public let unextendedModuleMapFilename = "unextended-module.modulemap"
+
 extension AbsolutePath {
   fileprivate var moduleEscapedPathString: String {
     return self.pathString.replacingOccurrences(of: "\\", with: "\\\\")
@@ -51,7 +54,7 @@ extension ClangTarget: ModuleMapProtocol {
     }
 }
 
-/// A module map generator for Clang targets.  Module map generation consists of two steps:
+/// A module map generator for Clang and Mixed language targets.  Module map generation consists of two steps:
 /// 1. Examining a target's public-headers directory to determine the appropriate module map type
 /// 2. Generating a module map for any target that doesn't have a custom module map file
 ///
@@ -67,6 +70,9 @@ extension ClangTarget: ModuleMapProtocol {
 /// These rules are documented at https://github.com/apple/swift-package-manager/blob/master/Documentation/Usage.md#creating-c-language-targets.  To avoid breaking existing packages, do not change the semantics here without making any change conditional on the tools version of the package that defines the target.
 ///
 /// Note that a module map generator doesn't require a target to already have been instantiated; it can operate on information that will later be used to instantiate a target.
+///
+/// For Mixed language targets, the module map generator will generate a module map that includes a
+/// module declaration for the Mixed target's C-language API and a submodule declaration for the Swift API.
 public struct ModuleMapGenerator {
 
     /// The name of the Clang target (for diagnostics).
@@ -174,8 +180,13 @@ public struct ModuleMapGenerator {
         return .umbrellaDirectory(publicHeadersDir)
     }
 
-    /// Generates a module map based of the specified type, throwing an error if anything goes wrong.  Any diagnostics are added to the receiver's diagnostics engine.
-    public func generateModuleMap(type: GeneratedModuleMapType, at path: AbsolutePath) throws {
+    /// Generates a module map based of the specified type, throwing an error if anything goes wrong.  Any
+    /// diagnostics are added to the receiver's diagnostics engine.
+    ///
+    /// The `interopHeaderPath` is the path to the generated interop header used to access a
+    /// module's Swift API in an Objective-C context (`$(ModuleName)-Swift.h`). If non-`nil`, the
+    /// created module map will include a submodule to access interop header's API.
+    public func generateModuleMap(type: GeneratedModuleMapType, at path: AbsolutePath, interopHeaderPath: AbsolutePath? = nil) throws {
         let stream = BufferedOutputByteStream()
         stream <<< "module \(moduleName) {\n"
         switch type {
@@ -186,6 +197,12 @@ public struct ModuleMapGenerator {
         }
         stream <<< "    export *\n"
         stream <<< "}\n"
+        if let interopHeaderPath = interopHeaderPath {
+            stream <<< "module \(moduleName).Swift {\n"
+            stream <<< "    header \"" <<< interopHeaderPath.pathString <<< "\"\n"
+            stream <<< "    requires objc\n"
+            stream <<< "}\n"
+        }
 
         // FIXME: This doesn't belong here.
         try fileSystem.createDirectory(path.parentDirectory, recursive: true)
