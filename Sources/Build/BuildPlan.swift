@@ -329,11 +329,60 @@ public final class ClangTargetBuildDescription {
         self.derivedSources = Sources(paths: [], root: tempsPath.appending(component: "DerivedSources"))
         self.isWithinMixedTarget = isWithinMixedTarget
 
-        // Try computing modulemap path for a C library.  This also creates the file in the file system, if needed.
-        if target.type == .library {
+        // Try computing modulemap path for a C library. This also creates the file in the file system, if needed.
+        if target.type == .library || (self.isWithinMixedTarget && target.type == .test) {
             // If there's a custom module map, use it as given.
             if case .custom(let path) = clangTarget.moduleMapType {
-                self.moduleMap = path
+                if isWithinMixedTarget {
+                    // Goals:
+                    // - 1. Copy custom module map to build directory.
+                    // - 2. Add the Swift submodule to the copy.
+                    // - 3. Use the VFS overlay system to swap in the modified
+                    //      module map accordingly.
+
+                    let customModuleMapContents: String = try fileSystem.readFileContents(path)
+
+
+                    // Check that custom module map does not contain a Swift
+                    // submodule.
+                    if customModuleMapContents.contains("\(clangTarget.c99name).Swift") {
+                        throw StringError("The target's module map may not " +
+                                          "contain a Swift submodule for " +
+                                          "the given module \(target.c99name).")
+                    }
+
+                    // Add a submodule to wrap the generated Swift header in
+                    // the custom module map.
+                    let generatedInteropHeaderPath = tempsPath
+                        .appending(component: "\(target.c99name)-Swift.h")
+
+                    // Write the modified contents to a new module map in the
+                    // build directory.
+                    let writePath = tempsPath.appending(component: moduleMapFilename)
+                    try fileSystem.createDirectory(writePath.parentDirectory, recursive: true)
+
+                    try fileSystem.writeFileContents(writePath) {
+                        """
+                        \(customModuleMapContents)
+
+                        module \(target.c99name).Swift {
+                            header "\(generatedInteropHeaderPath.pathString)"
+                            requires objc
+                        }
+                        """
+                    }
+
+                    self.moduleMap = writePath
+
+                    // TODO(ncooke3): Create the modified unextended module map.
+                    let unextendedWritePath = tempsPath.appending(component: unextendedModuleMapFilename)
+                    try? fileSystem.copy(
+                        from: path,
+                        to: unextendedWritePath
+                    )
+                } else {
+                    self.moduleMap = path
+                }
             }
             // If a generated module map is needed, generate one now in our temporary directory.
             else if let generatedModuleMapType = clangTarget.moduleMapType.generatedModuleMapType {
@@ -1434,7 +1483,7 @@ public final class MixedTargetBuildDescription {
             isWithinMixedTarget: true
         )
 
-        if target.type == .library {
+//        if target.type == .library {
             // Compiling the mixed target will require a Clang VFS overlay file
             // with mappings to the target's module map and public headers.
             let publicHeadersPath = clangTargetBuildDescription.clangTarget.includeDir
@@ -1462,35 +1511,39 @@ public final class MixedTargetBuildDescription {
 
             try VFSOverlay(roots: [
                 VFSOverlay.Directory(
-                    name: publicHeadersPath.pathString,
-                    contents:
-                        // Public headers
-                    	try VFSOverlay.overlayResources(
-                            directoryPath: publicHeadersPath,
-                            fileSystem: fileSystem
-                        )
-                ),
-                VFSOverlay.Directory(
                     name: buildArtifactDirectory.pathString,
                     contents: [
+                        // Umbrella header
+                        VFSOverlay.File(
+                            name: "MixedPackage.h",
+                            externalContents:
+                                publicHeadersPath.appending(component: "MixedPackage.h").pathString
+                        ),
+                        // Other header
+                        VFSOverlay.File(
+                            name: "Sith.h",
+                            externalContents:
+                                publicHeadersPath.appending(component: "Sith.h").pathString
+                        ),
+                        // Other header
+                        VFSOverlay.File(
+                            name: "droid_debug.h",
+                            externalContents:
+                                publicHeadersPath.appending(component: "droid_debug.h").pathString
+                        ),
                         // Module map
                         VFSOverlay.File(
                             name: moduleMapFilename,
                             externalContents:
                                 buildArtifactDirectory.appending(component: moduleMapFilename).pathString
-                        )
-                    ]
-                ),
-                VFSOverlay.Directory(
-                    name: buildArtifactDirectory.pathString,
-                    contents: [
+                        ),
                         // Generated $(ModuleName)-Swift.h header
                         VFSOverlay.File(
                             name: generatedInteropHeaderPath.basename,
                             externalContents: generatedInteropHeaderPath.pathString
                         )
                     ]
-                ),
+                )
             ]).write(to: allProductHeadersPath, fileSystem: fileSystem)
 
             swiftTargetBuildDescription.additionalFlags.append(
@@ -1512,7 +1565,7 @@ public final class MixedTargetBuildDescription {
             // the Swift half. For successful compilation, the directory
             // with the generated header is added as a header search path.
             clangTargetBuildDescription.additionalFlags.append("-I\(buildArtifactDirectory)")
-        }
+//        }
     }
 }
 

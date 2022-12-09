@@ -596,13 +596,13 @@ public final class MixedTarget: Target {
             )
         }
 
-        if case .custom = moduleMapType {
-            throw StringError(
-                "Target with mixed sources at \(path) contains a custom " +
-                "module map; targets with mixed language sources " +
-                "do not support custom module maps."
-            )
-        }
+//        if case .custom = moduleMapType {
+//            throw StringError(
+//                "Target with mixed sources at \(path) contains a custom " +
+//                "module map; targets with mixed language sources " +
+//                "do not support custom module maps."
+//            )
+//        }
 
         let swiftSources = Sources(
             paths: sources.paths.filter { path in
