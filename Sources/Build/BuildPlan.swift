@@ -356,7 +356,9 @@ public final class ClangTargetBuildDescription {
 
                     // Write the modified contents to a new module map in the
                     // build directory.
-                    let writePath = tempsPath.appending(component: moduleMapFilename)
+                    let writePath = tempsPath
+                        .appending(component: "Product")
+                        .appending(component: moduleMapFilename)
                     try fileSystem.createDirectory(writePath.parentDirectory, recursive: true)
 
                     // If the file exists with the identical contents, we don't need to rewrite it.
@@ -380,7 +382,9 @@ public final class ClangTargetBuildDescription {
                     // double as the unextended module map.
                     try? fileSystem.copy(
                         from: customModuleMapPath,
-                        to: tempsPath.appending(component: unextendedModuleMapFilename)
+                        to: tempsPath
+                            .appending(component: "Product")
+                            .appending(component: unextendedModuleMapFilename)
                     )
                 } else {
                     // When not building within a mixed target, use the custom
@@ -397,14 +401,13 @@ public final class ClangTargetBuildDescription {
                     fileSystem: fileSystem
                 )
 
-                let generatedInteropHeaderPath = isWithinMixedTarget
-                    ? tempsPath.appending(component: "\(target.c99name)-Swift.h") : nil
-
-                let moduleMapPath = tempsPath.appending(component: moduleMapFilename)
+                let moduleMapPath = tempsPath
+                    .appending(component: "Product")
+                    .appending(component: moduleMapFilename)
                 try moduleMapGenerator.generateModuleMap(
                     type: generatedModuleMapType,
                     at: moduleMapPath,
-                    interopHeaderPath: generatedInteropHeaderPath
+                    addSwiftSubmodule: true
                 )
 
                 if isWithinMixedTarget {
@@ -416,7 +419,9 @@ public final class ClangTargetBuildDescription {
                     // Swift part without the generated header being considered
                     // an input (because it won't exist yet and is an output of
                     // that compilation command).
-                    let unextendedModuleMapPath = tempsPath.appending(component: unextendedModuleMapFilename)
+                    let unextendedModuleMapPath = tempsPath
+                        .appending(component: "Product")
+                        .appending(component: unextendedModuleMapFilename)
                     try moduleMapGenerator.generateModuleMap(
                         type: generatedModuleMapType,
                         at: unextendedModuleMapPath
@@ -1504,6 +1509,8 @@ public final class MixedTargetBuildDescription {
             // with mappings to the target's module map and public headers.
             let publicHeadersPath = clangTargetBuildDescription.clangTarget.includeDir
             let buildArtifactDirectory = swiftTargetBuildDescription.tempsPath
+            let buildArtifactProductDirectory = buildArtifactDirectory.appending(component: "Product")
+            let generatedInteropHeaderPath = swiftTargetBuildDescription.objCompatibilityHeaderPath
             let allProductHeadersPath = buildArtifactDirectory
                 .appending(component: "all-product-headers.yaml")
 
@@ -1513,12 +1520,13 @@ public final class MixedTargetBuildDescription {
                 .appending(component: "unextended-module-overlay.yaml")
             try VFSOverlay(roots: [
                 VFSOverlay.Directory(
-                    name: buildArtifactDirectory.pathString,
+                    name: buildArtifactProductDirectory.pathString,
                     contents: [
                         VFSOverlay.File(
                             name: moduleMapFilename,
-                            externalContents:
-                                buildArtifactDirectory.appending(component: unextendedModuleMapFilename).pathString
+                            externalContents: buildArtifactProductDirectory
+                                .appending(component: unextendedModuleMapFilename)
+                                .pathString
                         )
                     ]
                 )
@@ -1528,7 +1536,7 @@ public final class MixedTargetBuildDescription {
             // name other than `module.modulemap`?
             try VFSOverlay(roots: [
                 VFSOverlay.Directory(
-                    name: buildArtifactDirectory.pathString,
+                    name: buildArtifactProductDirectory.pathString,
                     contents:
                         // Public headers
                     	try VFSOverlay.overlayResources(
@@ -1540,23 +1548,23 @@ public final class MixedTargetBuildDescription {
                                 // directory is used.
                                 !$0.pathString.hasSuffix("module.modulemap")
                             }
-                        )
+                        ) + [
+                            VFSOverlay.File(
+                                name: generatedInteropHeaderPath.basename,
+                                externalContents: generatedInteropHeaderPath.pathString
+                            )
+                        ]
                 )
             ]).write(to: allProductHeadersPath, fileSystem: fileSystem)
 
-            // The Objective-C umbrella is virtually placed in the build
-            // directory via a VFS overlay. This is done to preserve
-            // relative paths in custom module maps. But when resources
-            // exist, a warning will appear because the generated resource
-            // header (also in the build directory) is not included in the
-            // umbrella directory. Passing `-Wno-incomplete-umbrella` seems
-            // to prevent it but is not an ideal workaround.
-            // TODO(ncooke3): Investigate a way around this.
-
-            swiftTargetBuildDescription.additionalFlags.append(
+            swiftTargetBuildDescription.additionalFlags += [
                 // Builds Objective-C portion of module.
-                "-import-underlying-module"
-            )
+                "-import-underlying-module",
+                // Add the location of the module's Objective-C module map as
+                // a header search path.
+                "-I",
+                buildArtifactProductDirectory.pathString
+            ]
 
             swiftTargetBuildDescription.appendClangFlags(
                 // Pass VFS overlay to the underlying Clang compiler.
@@ -1571,7 +1579,7 @@ public final class MixedTargetBuildDescription {
             // generated interop Swift header.
             clangTargetBuildDescription.additionalFlags += [
                 "-I",
-                buildArtifactDirectory.pathString,
+                buildArtifactProductDirectory.pathString,
                 "-ivfsoverlay",
                 allProductHeadersPath.pathString
             ]

@@ -1122,7 +1122,7 @@ final class BuildPlanTests: XCTestCase {
 #endif
         XCTAssertEqual(try ext.basicArguments(isCXX: false), args)
         XCTAssertEqual(try ext.objects, [buildPath.appending(components: "extlib.build", "extlib.c.o")])
-        XCTAssertEqual(ext.moduleMap, buildPath.appending(components: "extlib.build", "module.modulemap"))
+        XCTAssertEqual(ext.moduleMap, buildPath.appending(components: "extlib.build", "Product", "module.modulemap"))
 
         let exe = try result.target(for: "exe").clangTarget()
         args = []
@@ -1145,9 +1145,9 @@ final class BuildPlanTests: XCTestCase {
         args += [
             "-I", Pkg.appending(components: "Sources", "exe", "include").pathString,
             "-I", Pkg.appending(components: "Sources", "lib", "include").pathString,
-            "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "module.modulemap"))",
+            "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "Product", "module.modulemap"))",
             "-I", ExtPkg.appending(components: "Sources", "extlib", "include").pathString,
-            "-fmodule-map-file=\(buildPath.appending(components: "extlib.build", "module.modulemap"))",
+            "-fmodule-map-file=\(buildPath.appending(components: "extlib.build", "Product", "module.modulemap"))",
         ]
 #if !os(Windows)    // FIXME(5473) - modules flags on Windows dropped
         args += ["-fmodules-cache-path=\(buildPath.appending(components: "ModuleCache"))"]
@@ -1436,8 +1436,9 @@ final class BuildPlanTests: XCTestCase {
             "-target", "\(defaultTargetTriple)", "-swift-version", "4",
             "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j),
             "-DSWIFT_PACKAGE", "-DDEBUG", "-Xcc",
-            "-fmodule-map-file=/path/to/build/debug/lib.build/module.modulemap",
-            "-Xcc", "-I", "-Xcc", "/Pkg/Sources/lib/include",
+            "-fmodule-map-file=/path/to/build/debug/lib.build/Product/module.modulemap",
+            "-Xcc", "-ivfsoverlay", "-Xcc",
+            "/path/to/build/debug/lib.build/all-product-headers.yaml",
             "-module-cache-path",
             "\(buildPath.appending(components: "ModuleCache"))", .anySequence
         ])
@@ -1446,8 +1447,9 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertMatch(swiftPartOfLib, [
             "-target", "\(defaultTargetTriple)", "-swift-version", "4",
             "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j),
-            "-DSWIFT_PACKAGE", "-DDEBUG", "-import-underlying-module", "-Xcc",
-            "-ivfsoverlay", "-Xcc", "/path/to/build/debug/lib.build/all-product-headers.yaml",
+            "-DSWIFT_PACKAGE", "-DDEBUG", "-import-underlying-module", "-I",
+            "/path/to/build/debug/lib.build/Product", "-Xcc", "-ivfsoverlay",
+            "-Xcc", "/path/to/build/debug/lib.build/all-product-headers.yaml",
             "-Xcc", "-ivfsoverlay", "-Xcc",
             "/path/to/build/debug/lib.build/unextended-module-overlay.yaml",
             "-module-cache-path",
@@ -1460,8 +1462,8 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertMatch(clangPartOfLib, [
             "-fobjc-arc", "-target", "x86_64-apple-macosx10.13", "-g", "-O0",
             "-DSWIFT_PACKAGE=1", "-DDEBUG=1", "-fblocks", "-fmodules",
-            "-fmodule-name=lib", "-I", "/Pkg/Sources/lib/include",
-            "-I/path/to/build/debug/lib.build",
+            "-fmodule-name=lib", "-I", "/path/to/build/debug/lib.build/Product",
+            "-ivfsoverlay", "/path/to/build/debug/lib.build/all-product-headers.yaml",
             "-fmodules-cache-path=/path/to/build/debug/ModuleCache"
         ])
 
@@ -1475,7 +1477,7 @@ final class BuildPlanTests: XCTestCase {
 
         XCTAssertEqual(
             try result.target(for: "lib").mixedTarget().moduleMap?.pathString,
-            buildPath.appending(components: "lib.build", "module.modulemap").pathString
+            buildPath.appending(components: "lib.build", "Product", "module.modulemap").pathString
         )
 
         XCTAssertEqual(try result.buildProduct(for: "exe").linkArguments(), [
@@ -1555,10 +1557,10 @@ final class BuildPlanTests: XCTestCase {
 #endif
         XCTAssertEqual(try lib.basicArguments(isCXX: false), args)
         XCTAssertEqual(try lib.objects, [buildPath.appending(components: "lib.build", "lib.c.o")])
-        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "module.modulemap"))
+        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "Product", "module.modulemap"))
 
         let exe = try result.target(for: "exe").swiftTarget().compileArguments()
-        XCTAssertMatch(exe, [.anySequence, "-swift-version", "4", "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j), "-DSWIFT_PACKAGE", "-DDEBUG","-Xcc", "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "module.modulemap"))", "-Xcc", "-I", "-Xcc", "\(Pkg.appending(components: "Sources", "lib", "include"))", "-module-cache-path", "\(buildPath.appending(components: "ModuleCache"))", .anySequence])
+        XCTAssertMatch(exe, [.anySequence, "-swift-version", "4", "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j), "-DSWIFT_PACKAGE", "-DDEBUG","-Xcc", "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "Product", "module.modulemap"))", "-Xcc", "-I", "-Xcc", "\(Pkg.appending(components: "Sources", "lib", "include"))", "-module-cache-path", "\(buildPath.appending(components: "ModuleCache"))", .anySequence])
 
       #if os(macOS)
         XCTAssertEqual(try result.buildProduct(for: "exe").linkArguments(), [
@@ -1691,7 +1693,7 @@ final class BuildPlanTests: XCTestCase {
 
         let buildPath: AbsolutePath = plan.buildParameters.dataPath.appending(components: "debug")
 
-        XCTAssertEqual(try plan.createREPLArguments().sorted(), ["-I\(Dep.appending(components: "Sources", "CDep", "include"))", "-I\(buildPath)", "-I\(buildPath.appending(components: "lib.build"))", "-L\(buildPath)", "-lpkg__REPL", "repl"])
+        XCTAssertEqual(try plan.createREPLArguments().sorted(), ["-I\(Dep.appending(components: "Sources", "CDep", "include"))", "-I\(buildPath)", "-I\(buildPath.appending(components: "lib.build", "Product"))", "-L\(buildPath)", "-lpkg__REPL", "repl"])
 
         XCTAssertEqual(plan.graph.allProducts.map({ $0.name }).sorted(), [
             "Dep",
@@ -2519,7 +2521,7 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertEqual(try lib.basicArguments(isCXX: true), expectedLibBasicArgs)
 
         XCTAssertEqual(try lib.objects, [buildPath.appending(components: "lib.build", "lib.cpp.o")])
-        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "module.modulemap"))
+        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "Product", "module.modulemap"))
 
     #if os(macOS)
         XCTAssertEqual(try result.buildProduct(for: "lib").linkArguments(), [
@@ -2958,10 +2960,10 @@ final class BuildPlanTests: XCTestCase {
         ]
         XCTAssertEqual(try lib.basicArguments(isCXX: false), args)
         XCTAssertEqual(try lib.objects, [buildPath.appending(components: "lib.build", "lib.c.o")])
-        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "module.modulemap"))
+        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "Product", "module.modulemap"))
 
         let exe = try result.target(for: "exe").swiftTarget().compileArguments()
-        XCTAssertMatch(exe, ["-swift-version", "4", "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j), "-DSWIFT_PACKAGE", "-DDEBUG","-Xcc", "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "module.modulemap"))", "-Xcc", "-I", "-Xcc", "\(Pkg.appending(components: "Sources", "lib", "include"))", "-module-cache-path", "\(buildPath.appending(components: "ModuleCache"))", .anySequence])
+        XCTAssertMatch(exe, ["-swift-version", "4", "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j), "-DSWIFT_PACKAGE", "-DDEBUG","-Xcc", "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "Product", "module.modulemap"))", "-Xcc", "-I", "-Xcc", "\(Pkg.appending(components: "Sources", "lib", "include"))", "-module-cache-path", "\(buildPath.appending(components: "ModuleCache"))", .anySequence])
 
         XCTAssertEqual(try result.buildProduct(for: "exe").linkArguments(), [
             result.plan.buildParameters.toolchain.swiftCompilerPath.pathString,
@@ -3027,7 +3029,7 @@ final class BuildPlanTests: XCTestCase {
         ]
         XCTAssertEqual(try lib.basicArguments(isCXX: false), args)
         XCTAssertEqual(try lib.objects, [buildPath.appending(components: "lib.build", "lib.c.o")])
-        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "module.modulemap"))
+        XCTAssertEqual(lib.moduleMap, buildPath.appending(components: "lib.build", "Product", "module.modulemap"))
 
         let exe = try result.target(for: "app").swiftTarget().compileArguments()
         XCTAssertMatch(
@@ -3035,7 +3037,7 @@ final class BuildPlanTests: XCTestCase {
             [
                 "-swift-version", "4", "-enable-batch-mode", "-Onone", "-enable-testing", "-g",
                 .equal(j), "-DSWIFT_PACKAGE", "-DDEBUG","-Xcc",
-                "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "module.modulemap"))",
+                "-fmodule-map-file=\(buildPath.appending(components: "lib.build", "Product", "module.modulemap"))",
                 "-Xcc", "-I", "-Xcc", "\(Pkg.appending(components: "Sources", "lib", "include"))",
                 "-module-cache-path", "\(buildPath.appending(components: "ModuleCache"))", .anySequence
             ]
