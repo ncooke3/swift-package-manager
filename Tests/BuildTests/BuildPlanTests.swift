@@ -24,6 +24,13 @@ import XCTest
 import enum TSCUtility.Diagnostics
 import struct TSCUtility.Triple
 
+// TODO(ncooke3): Add test for building statically linked mixed target.
+// TODO(ncooke3): Add test for building dynamically linked mixed target.
+
+// TODO(ncooke3): Add test for expected failure cases:
+// - Non-Library target
+// - Non-Test target
+
 final class BuildPlanTests: XCTestCase {
     let inputsDir = AbsolutePath(path: #file).parentDirectory.appending(components: "Inputs")
 

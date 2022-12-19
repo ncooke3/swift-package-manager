@@ -792,8 +792,14 @@ public final class PackageBuilder {
         let buildSettings = try self.buildSettings(for: manifestTarget, targetRoot: potentialModule.path)
 
         // Compute the path to public headers directory.
-        let publicHeaderComponent = manifestTarget.publicHeadersPath ?? ClangTarget.defaultPublicHeadersComponent
-        let publicHeadersPath = potentialModule.path.appending(try RelativePath(validating: publicHeaderComponent))
+        let publicHeadersPath: AbsolutePath
+        switch potentialModule.type {
+        case .test:
+            publicHeadersPath = potentialModule.path
+        default:
+            let publicHeaderComponent = manifestTarget.publicHeadersPath ?? ClangTarget.defaultPublicHeadersComponent
+            publicHeadersPath = potentialModule.path.appending(try RelativePath(validating: publicHeaderComponent))
+        }
         guard publicHeadersPath.isDescendantOfOrEqual(to: potentialModule.path) else {
             throw ModuleError.invalidPublicHeadersDirectory(potentialModule.name)
         }
@@ -863,7 +869,8 @@ public final class PackageBuilder {
             let moduleMapType = try findModuleMapType(
                 for: potentialModule,
                 targetType: targetType,
-                publicHeadersPath: publicHeadersPath
+                publicHeadersPath: publicHeadersPath,
+                isMixedTarget: true
             )
 
             return try MixedTarget(
@@ -1093,13 +1100,21 @@ public final class PackageBuilder {
     }
 
     /// Determines the type of module map that will be appropriate for a potential target based on its header layout.
-    private func findModuleMapType(for potentialModule: PotentialModule, targetType: Target.Kind,  publicHeadersPath: AbsolutePath) throws -> ModuleMapType {
+    private func findModuleMapType(
+        for potentialModule: PotentialModule,
+        targetType: Target.Kind,
+        publicHeadersPath: AbsolutePath,
+        isMixedTarget: Bool = false
+    ) throws -> ModuleMapType {
         if fileSystem.exists(publicHeadersPath) {
             let moduleMapGenerator = ModuleMapGenerator(targetName: potentialModule.name, moduleName: potentialModule.name.spm_mangledToC99ExtendedIdentifier(), publicHeadersDir: publicHeadersPath, fileSystem: fileSystem)
             return moduleMapGenerator.determineModuleMapType(observabilityScope: self.observabilityScope)
         } else if targetType == .library, manifest.toolsVersion >= .v5_5 {
             // If this clang target is a library, it must contain "include" directory.
             throw ModuleError.invalidPublicHeadersDirectory(potentialModule.name)
+        } else if targetType == .test && isMixedTarget {
+            // TODO(ncooke3): Revisit and add comment.
+            return .umbrellaDirectory(potentialModule.path)
         } else {
             return .none
         }
