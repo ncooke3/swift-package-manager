@@ -1568,8 +1568,7 @@ public final class MixedTargetBuildDescription {
                     contents:
                         // All headers
                     try VFSOverlay.overlayResources(
-                        // TODO(ncooke3): #456 Figure out a way to get the root sources path.
-                        directoryPath: publicHeadersPath.parentDirectory,
+                        directoryPath: mixedTarget.path,
                         fileSystem: fileSystem,
                         shouldInclude: {
                             // Only include headers.
