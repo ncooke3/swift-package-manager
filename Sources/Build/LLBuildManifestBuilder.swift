@@ -606,7 +606,6 @@ extension LLBuildManifestBuilder {
                 for object in try target.clangTargetBuildDescription.objects {
                     inputs.append(file: object)
                 }
-
             case nil:
                 throw InternalError("unexpected: target \(target) not in target map \(plan.targetMap)")
             }
