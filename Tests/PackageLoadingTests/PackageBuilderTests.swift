@@ -51,14 +51,18 @@ class PackageBuilderTests: XCTestCase {
         let manifest = Manifest.createRootManifest(
             name: "pkg",
             path: .root,
-            toolsVersion: .v3,
+            // Use older tools version where mixed targets are not supported.
+            toolsVersion: .v5,
             targets: [
                 try TargetDescription(name: "foo"),
             ]
         )
         PackageBuilderTester(manifest, in: fs) { _, diagnostics in
-            // TODO(ncooke3): Update error message with support version.
-            diagnostics.check(diagnostic: "target at '\(foo)' contains mixed language source files; feature not supported until tools version XX", severity: .error)
+            // FIXME(ncooke3): Update error message with support version.
+            diagnostics.check(
+                diagnostic: "target at '\(foo)' contains mixed language source files; feature not supported until tools version XX",
+                severity: .error
+            )
         }
     }
 
@@ -76,6 +80,8 @@ class PackageBuilderTests: XCTestCase {
         let manifest = Manifest.createRootManifest(
             name: "pkg",
             path: .root,
+            // FIXME(ncooke3): Update with next version of SPM.
+            toolsVersion: .vNext,
             targets: [
                 try TargetDescription(name: "foo"),
             ]
@@ -103,6 +109,8 @@ class PackageBuilderTests: XCTestCase {
         let manifest = Manifest.createRootManifest(
             name: "pkg",
             path: .root,
+            // FIXME(ncooke3): Update with next version of SPM.
+            toolsVersion: .vNext,
             targets: [
                 try TargetDescription(name: "foo"),
             ]
@@ -114,6 +122,31 @@ class PackageBuilderTests: XCTestCase {
                 module.check(includeDir: foo.appending(component: "include").pathString)
                 module.check(moduleMapType: .custom(foo.appending(components: "include", "module.modulemap")))
             }
+        }
+    }
+
+    func testMixedTargetsDoNotSupportExecutables() throws {
+        let foo: AbsolutePath = AbsolutePath(path: "/Sources/foo")
+
+        let fs = InMemoryFileSystem(emptyFiles:
+            foo.appending(components: "Foo.swift").pathString,
+            foo.appending(components: "main.c").pathString
+        )
+
+        let manifest = Manifest.createRootManifest(
+            name: "pkg",
+            path: .root,
+            // FIXME(ncooke3): Update with next version of SPM.
+            toolsVersion: .vNext,
+            targets: [
+                try TargetDescription(name: "foo", type: .executable),
+            ]
+        )
+        PackageBuilderTester(manifest, in: fs) { _, diagnostics in
+            diagnostics.check(
+                diagnostic: "Target with mixed sources at \(foo) is a \(Target.Kind.executable) target; targets with mixed language sources are only supported for library and test targets.",
+                severity: .error
+            )
         }
     }
 

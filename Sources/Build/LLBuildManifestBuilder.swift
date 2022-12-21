@@ -214,7 +214,7 @@ extension LLBuildManifestBuilder {
 
         // TODO(ncooke3): Do we need to support building mixed targets with the
         // `--use-integrated-swiftdriver` or `--emit-swift-module-separately`
-        // flags?
+        // flags? Ideally no because doing so does not look straightforward.
         if target.isWithinMixedTarget {
             try self.addCmdWithBuiltinSwiftTool(
                 target,
@@ -400,7 +400,6 @@ extension LLBuildManifestBuilder {
                                                                      explicitDependencyJobTracker: explicitDependencyJobTracker)
                 case .clang(let desc):
                     try self.createClangCompileCommand(desc)
-
                 case .mixed(let desc):
                     try self.createMixedCompileCommand(desc)
             }

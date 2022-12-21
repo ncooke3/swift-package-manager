@@ -821,6 +821,8 @@ final class ModuleAliasingBuildTests: XCTestCase {
                 Manifest.createRootManifest(
                     name: "fooPkg",
                     path: .init(path: "/fooPkg"),
+                    // FIXME(ncooke3): Update with next version of SPM.
+                    toolsVersion: .vNext,
                     products: [
                         ProductDescription(name: "Utils", type: .library(.automatic), targets: ["Utils"]),
                     ],
