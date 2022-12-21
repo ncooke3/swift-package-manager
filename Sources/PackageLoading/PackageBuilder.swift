@@ -155,7 +155,6 @@ extension Target {
 
         /// The target contains an invalid mix of languages (e.g. both Swift and C).
         case mixedSources(AbsolutePath)
-
     }
 }
 
