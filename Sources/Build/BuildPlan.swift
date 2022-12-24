@@ -1336,10 +1336,13 @@ public final class MixedTargetBuildDescription {
 
     /// The path to the VFS overlay file that overlays the public headers of
     /// the Clang part of the target over the target's build directory.
-    private(set) var allProductHeadersOverlay: AbsolutePath? = nil
+    let allProductHeadersOverlay: AbsolutePath?
 
     /// The modulemap file for this target.
     let moduleMap: AbsolutePath
+
+    /// Path to the temporary directory for this target.
+    private let tempsPath: AbsolutePath
 
     /// The path to the Objective-C compatibility header for the underlying Swift target.
     private let interopHeaderPath: AbsolutePath
@@ -1380,6 +1383,7 @@ public final class MixedTargetBuildDescription {
 
         self.target = target
         self.fileSystem = fileSystem
+        self.tempsPath = buildParameters.buildPath.appending(component: target.c99name + ".build")
 
         let clangResolvedTarget = ResolvedTarget(
             target: mixedTarget.clangTarget,
@@ -1416,11 +1420,16 @@ public final class MixedTargetBuildDescription {
 
         self.interopHeaderPath = swiftTargetBuildDescription.objCompatibilityHeaderPath
 
-        let buildArtifactDirectory = swiftTargetBuildDescription.tempsPath
-        let buildArtifactIntermediatesDirectory = buildArtifactDirectory
-            .appending(component: "Intermediates")
-        let buildArtifactProductDirectory = buildArtifactDirectory
-            .appending(component: "Product")
+        // A mixed target's build directory uses two subdirectories to
+        // distinguish between build artifacts:
+        // - Intermediates: Stores artifacts used during the target's build.
+        // - Product: Stores artifacts used by clients of the target.
+        let intermediatesDirectory = tempsPath.appending(component: "Intermediates")
+        let productDirectory = tempsPath.appending(component: "Product")
+
+        // Filenames for VFS overlay files.
+        let allProductHeadersFilename = "all-product-headers.yaml"
+        let unextendedModuleOverlayFilename = "unextended-module-overlay.yaml"
 
         // Used to generate both product and intermediate artifacts for the
         // target.
@@ -1435,8 +1444,7 @@ public final class MixedTargetBuildDescription {
 
         // Path to the module map used by clients to access the mixed target's
         // public API.
-        let productModuleMapPath = buildArtifactProductDirectory
-            .appending(component: moduleMapFilename)
+        let productModuleMapPath = productDirectory.appending(component: moduleMapFilename)
 
         switch mixedTarget.clangTarget.moduleMapType {
         // When the mixed target has a custom module map, clients of the target
@@ -1480,8 +1488,7 @@ public final class MixedTargetBuildDescription {
             // for the target. The below VFS overlay will redirect to the
             // contents of the modified module map.
             self.moduleMap = customModuleMapPath
-            self.allProductHeadersOverlay = buildArtifactProductDirectory
-                .appending(component: "all-product-headers.yaml")
+            self.allProductHeadersOverlay = productDirectory.appending(component: allProductHeadersFilename)
 
             try VFSOverlay(
                 roots: [
@@ -1513,6 +1520,9 @@ public final class MixedTargetBuildDescription {
 
             // Set the generated module map as the module map for the target.
             self.moduleMap = productModuleMapPath
+            // An overlay is not neccesssary as there was no original custom
+            // module map to replace.
+            self.allProductHeadersOverlay = nil
         }
 
         // MARK: Generate intermediate artifacts used to build the target.
@@ -1522,7 +1532,7 @@ public final class MixedTargetBuildDescription {
         // TODO(ncooke3): I wonder if this is really needed?
         // 1. Generate an intermediate module map that exposes all headers,
         // including the submodule with the generated Swift header.
-        let intermediateModuleMapPath = buildArtifactIntermediatesDirectory
+        let intermediateModuleMapPath = intermediatesDirectory
             .appending(component: moduleMapFilename)
         try moduleMapGenerator.generateModuleMap(
             type: .umbrellaDirectory(mixedTarget.clangTarget.path),
@@ -1535,8 +1545,7 @@ public final class MixedTargetBuildDescription {
         // be needed to access types from the Objective-C part of the target.
         // However, this module map should not expose the generated Swift
         // header since it will not exist yet.
-        let unextendedModuleMapPath = buildArtifactIntermediatesDirectory
-            .appending(component: unextendedModuleMapFilename)
+        let unextendedModuleMapPath = intermediatesDirectory.appending(component: unextendedModuleMapFilename)
         // Generating module maps that include non-Objective-C headers is not
         // supported.
         // FIXME(ncooke3): Link to evolution post.
@@ -1565,11 +1574,10 @@ public final class MixedTargetBuildDescription {
             // be used as the root of the VFS overlay. In this case, the
             // VFS overlay's sole purpose is to expose the generated Swift
             // header.
-            rootOverlayResourceDirectory = buildArtifactIntermediatesDirectory
+            rootOverlayResourceDirectory = intermediatesDirectory
         }
 
-        let allProductHeadersPath = buildArtifactIntermediatesDirectory
-            .appending(component: "all-product-headers.yaml")
+        let allProductHeadersPath = intermediatesDirectory.appending(component: allProductHeadersFilename)
         try VFSOverlay(roots: [
             VFSOverlay.Directory(
                 name: rootOverlayResourceDirectory.pathString,
@@ -1578,7 +1586,7 @@ public final class MixedTargetBuildDescription {
                     // module map in the intermediates directory.
                     VFSOverlay.File(
                         name: moduleMapFilename,
-                        externalContents: buildArtifactIntermediatesDirectory
+                        externalContents: intermediatesDirectory
                             .appending(component: moduleMapFilename)
                             .pathString
                     ),
@@ -1592,8 +1600,7 @@ public final class MixedTargetBuildDescription {
             )
         ]).write(to: allProductHeadersPath, fileSystem: fileSystem)
 
-        let unextendedModuleMapOverlayPath = buildArtifactIntermediatesDirectory
-            .appending(component: "unextended-module-overlay.yaml")
+        let unextendedModuleMapOverlayPath = intermediatesDirectory.appending(component: unextendedModuleOverlayFilename)
         try VFSOverlay(roots: [
             VFSOverlay.Directory(
                 name: rootOverlayResourceDirectory.pathString,
@@ -1602,7 +1609,7 @@ public final class MixedTargetBuildDescription {
                     // module map in the intermediates directory.
                     VFSOverlay.File(
                         name: moduleMapFilename,
-                        externalContents: buildArtifactIntermediatesDirectory
+                        externalContents: intermediatesDirectory
                             .appending(component: unextendedModuleMapFilename)
                             .pathString
                     )
@@ -1641,7 +1648,7 @@ public final class MixedTargetBuildDescription {
             // The above overlay adds the interop header in the
             // intermediates directory. Pass the intermediates directory as
             // a search path so the generated header can be imported.
-            "-I", buildArtifactIntermediatesDirectory.pathString
+            "-I", intermediatesDirectory.pathString
         ]
     }
 }
