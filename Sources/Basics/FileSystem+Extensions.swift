@@ -341,3 +341,24 @@ extension FileSystem {
         try self.removeFileTree(tempDirectory)
     }
 }
+
+extension FileSystem {
+    /// Writes the given bytes to the given path. If the file at the given path already exists with the given
+    /// bytes, nothing is done.
+    /// - Parameters:
+    ///   - path: The given path to write to.
+    ///   - bytes: The given byte string to write.
+    /// - Note: If the given path's parent directory does not exist, the file system will recursively create
+    /// intermediate directories so the given path can be resolved.
+    public func writeFileContentsIfNeeded(_ path: AbsolutePath, bytes: ByteString) throws {
+        try createDirectory(path.parentDirectory, recursive: true)
+
+        // If the file exists with the identical contents, we don't need to
+        // rewrite it. Otherwise, compiler will recompile even if nothing else
+        // has changed.
+        if let contents = try? readFileContents(path), contents == bytes {
+            return
+        }
+        try writeFileContents(path, bytes: bytes)
+    }
+}

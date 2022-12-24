@@ -186,7 +186,7 @@ public struct ModuleMapGenerator {
         type: GeneratedModuleMapType?,
         at path: AbsolutePath,
         excludeHeaders: [AbsolutePath] = [],
-        addSwiftSubmodule: Bool = false
+        interopHeaderPath: AbsolutePath? = nil
     ) throws {
         let stream = BufferedOutputByteStream()
         stream <<< "module \(moduleName) {\n"
@@ -204,22 +204,16 @@ public struct ModuleMapGenerator {
 
         stream <<< "    export *\n"
         stream <<< "}\n"
-        if addSwiftSubmodule {
+        if let interopHeaderPath = interopHeaderPath {
             stream <<< "module \(moduleName).Swift {\n"
-            stream <<< "    header \"\(moduleName)-Swift.h\"\n"
+            stream <<< "    header \"\(interopHeaderPath.moduleEscapedPathString)\"\n"
             stream <<< "    requires objc\n"
             stream <<< "}\n"
         }
 
-        // FIXME: This doesn't belong here.
-        try fileSystem.createDirectory(path.parentDirectory, recursive: true)
-
         // If the file exists with the identical contents, we don't need to rewrite it.
         // Otherwise, compiler will recompile even if nothing else has changed.
-        if let contents = try? fileSystem.readFileContents(path), contents == stream.bytes {
-            return
-        }
-        try fileSystem.writeFileContents(path, bytes: stream.bytes)
+        try fileSystem.writeFileContentsIfNeeded(path, bytes: stream.bytes)
     }
 }
 
