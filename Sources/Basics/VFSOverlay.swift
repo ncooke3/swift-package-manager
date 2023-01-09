@@ -57,13 +57,14 @@ public struct VFSOverlay: Encodable {
             super.init(name: name, type: "directory")
         }
 
-        // TODO(ncooke3): Do we need to wrap this in `#if swift(>=5.4)`?
+#if swift(>=5.4)
         public convenience init(
             name: String,
             @VFSOverlayBuilder contents: () -> [VFSOverlay.Resource]
         ) {
             self.init(name: name, contents: contents())
         }
+#endif
 
         public override func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
@@ -98,7 +99,7 @@ public struct VFSOverlay: Encodable {
     }
 }
 
-// TODO(ncooke3): Do we need to wrap this in `#if swift(>=5.4)`?
+#if swift(>=5.4)
 @resultBuilder
 public struct VFSOverlayBuilder {
     public static func buildBlock(_ components: [VFSOverlay.Resource]...) -> [VFSOverlay.Resource] {
@@ -117,3 +118,4 @@ public struct VFSOverlayBuilder {
         return components ?? []
     }
 }
+#endif

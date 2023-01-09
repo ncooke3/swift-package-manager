@@ -1533,6 +1533,7 @@ public final class MixedTargetBuildDescription {
             self.moduleMap = customModuleMapPath
             self.allProductHeadersOverlay = productDirectory.appending(component: allProductHeadersFilename)
 
+#if swift(>=5.4)
             try VFSOverlay(roots: [
                 VFSOverlay.Directory(name: customModuleMapPath.parentDirectory.pathString) {
                     VFSOverlay.File(
@@ -1550,6 +1551,7 @@ public final class MixedTargetBuildDescription {
                     }
                 }
             ]).write(to: self.allProductHeadersOverlay!, fileSystem: fileSystem)
+#endif
 
         // When the mixed target does not have a custom module map, one will be
         // generated as a product for use by clients.
@@ -1572,6 +1574,7 @@ public final class MixedTargetBuildDescription {
                 // If an umbrella header was generated, it needs to be
                 // overlayed within the public headers directory.
                 self.allProductHeadersOverlay = productDirectory.appending(component: allProductHeadersFilename)
+#if swift(>=5.4)
                 try VFSOverlay(roots: [
                     VFSOverlay.Directory(name: mixedTarget.clangTarget.includeDir.pathString) {
                         VFSOverlay.Directory(name: mixedTarget.c99name) {
@@ -1582,6 +1585,7 @@ public final class MixedTargetBuildDescription {
                         }
                     }
                 ]).write(to: self.allProductHeadersOverlay!, fileSystem: fileSystem)
+#endif
             } else {
                 // Else, no product overlay is needed.
                 self.allProductHeadersOverlay = nil
@@ -1638,6 +1642,7 @@ public final class MixedTargetBuildDescription {
         }
 
         let allProductHeadersPath = intermediatesDirectory.appending(component: allProductHeadersFilename)
+#if swift(>=5.4)
         try VFSOverlay(roots: [
             VFSOverlay.Directory(name: rootOverlayResourceDirectory.pathString) {
                 // Redirect the `module.modulemap` to the modified
@@ -1663,8 +1668,10 @@ public final class MixedTargetBuildDescription {
                 }
             }
         ]).write(to: allProductHeadersPath, fileSystem: fileSystem)
+#endif
 
         let unextendedModuleMapOverlayPath = intermediatesDirectory.appending(component: unextendedModuleOverlayFilename)
+#if swift(>=5.4)
         try VFSOverlay(roots: [
             VFSOverlay.Directory(name: rootOverlayResourceDirectory.pathString) {
                 // Redirect the `module.modulemap` to the *unextended*
@@ -1675,6 +1682,7 @@ public final class MixedTargetBuildDescription {
                 )
             }
         ]).write(to: unextendedModuleMapOverlayPath, fileSystem: fileSystem)
+#endif
 
         // 4. Tie everything together by passing build flags.
 
