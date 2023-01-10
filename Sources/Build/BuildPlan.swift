@@ -1451,7 +1451,7 @@ public final class MixedTargetBuildDescription {
         // needed and will later use a VFS overlay to make the generated header
         // appear in the proper location so the bridging header import in the
         // generated interop header can be resolved during the build.
-        var generatedUmbrellaHeaderPath: AbsolutePath? = nil
+        let generatedUmbrellaHeaderPath: AbsolutePath?
         let relativeUmbrellaHeaderPath =
             RelativePath("\(mixedTarget.c99name)/\(mixedTarget.c99name).h")
         let potentialUmbrellaHeaderPath =
@@ -1481,6 +1481,8 @@ public final class MixedTargetBuildDescription {
                 generatedUmbrellaHeaderPath!,
                 bytes: stream.bytes
             )
+        } else {
+            generatedUmbrellaHeaderPath = nil
         }
 
         // MARK: Generate products to be used by client of the target.
