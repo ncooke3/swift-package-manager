@@ -79,6 +79,11 @@ public final class ClangTargetBuildDescription {
     /// The filesystem to operate on.
     private let fileSystem: FileSystem
 
+    /// Whether or not the target belongs to a mixed language target.
+    ///
+    /// Mixed language targets consist of an underlying Swift and Clang target.
+    let isWithinMixedTarget: Bool
+
     /// If this target is a test target.
     public var isTestTarget: Bool {
         target.type == .test
@@ -89,7 +94,8 @@ public final class ClangTargetBuildDescription {
         target: ResolvedTarget,
         toolsVersion: ToolsVersion,
         buildParameters: BuildParameters,
-        fileSystem: FileSystem
+        fileSystem: FileSystem,
+        isWithinMixedTarget: Bool = false
     ) throws {
         guard target.underlyingTarget is ClangTarget else {
             throw InternalError("underlying target type mismatch \(target)")
@@ -101,9 +107,12 @@ public final class ClangTargetBuildDescription {
         self.buildParameters = buildParameters
         self.tempsPath = buildParameters.buildPath.appending(component: target.c99name + ".build")
         self.derivedSources = Sources(paths: [], root: tempsPath.appending(component: "DerivedSources"))
+        self.isWithinMixedTarget = isWithinMixedTarget
 
-        // Try computing modulemap path for a C library.  This also creates the file in the file system, if needed.
-        if target.type == .library {
+        // Try computing the modulemap path, creating a module map in the
+        // file system if necessary. If building for a mixed target, the mixed
+        // target build description handle the module map.
+        if target.type == .library, !isWithinMixedTarget {
             // If there's a custom module map, use it as given.
             if case .custom(let path) = clangTarget.moduleMapType {
                 self.moduleMap = path
