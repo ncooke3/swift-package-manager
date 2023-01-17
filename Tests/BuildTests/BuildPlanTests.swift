@@ -2556,7 +2556,7 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertThrowsError(
             try BuildPlanResult(plan: BuildPlan(
                 buildParameters: mockBuildParameters(shouldLinkStaticSwiftStdlib: true),
-                graph: graph,
+                graph: g,
                 fileSystem: fs,
                 observabilityScope: observability.topScope
             )),
@@ -2663,7 +2663,7 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertThrowsError(
             try BuildPlanResult(plan: BuildPlan(
                 buildParameters: mockBuildParameters(shouldLinkStaticSwiftStdlib: true),
-                graph: graph,
+                graph: g,
                 fileSystem: fs,
                 observabilityScope: observability.topScope
             )),
