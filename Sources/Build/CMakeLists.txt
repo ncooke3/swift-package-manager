@@ -11,6 +11,7 @@ add_library(Build
   BuildDescription/PluginDescription.swift
   BuildDescription/ProductBuildDescription.swift
   BuildDescription/SwiftTargetBuildDescription.swift
+  BuildDescription/MixedTargetBuildDescription.swift
   BuildDescription/TargetBuildDescription.swift
   BuildOperationBuildSystemDelegateHandler.swift
   BuildOperation.swift
