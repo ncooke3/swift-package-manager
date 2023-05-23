@@ -1,11 +1,13 @@
 module MixedTargetWithPublicCXXAPI {
     header "ObjcCalculator.h"
+    header "CXXSumFinder.hpp"
 
-    module PublicCXXAPI {
-        header "CXXSumFinder.hpp"
-        requires !swift
-        export *
-    }
+//    module PublicCXXAPI {
+//        header "CXXSumFinder.hpp"
+//        requires !swift
+//        requires cplusplus
+//        export *
+//    }
 
     export *
 }

@@ -178,6 +178,10 @@ public final class MixedTargetBuildDescription {
                 .appending(components: umbrellaHeaderPathComponents)
             // Populate a stream that will become the generated umbrella header.
             let stream = BufferedOutputByteStream()
+            // TODO(ncooke3): Rather than manually find each header, we should
+            // be able to instead generate the module map via an umbrella
+            // directory. This is because we no longer need to filter out C++
+            // headers.
             mixedTarget.clangTarget.headers
                 // One of the requirements for a Swift API to be Objective-C
                 // compatible and therefore included in the generated interop
@@ -187,9 +191,6 @@ public final class MixedTargetBuildDescription {
                 // Because of this, the generated umbrella header will only
                 // include public headers so all other can be filtered out.
                 .filter { $0.isDescendant(of: mixedTarget.clangTarget.includeDir) }
-                // Filter out non-Objective-C/C headers.
-                // TODO(ncooke3): C++ headers can be ".h". How else can we rule them out?
-                .filter { $0.basename.hasSuffix(".h") }
                 // Add each remaining header to the generated umbrella header.
                 .forEach {
                     // Import the header, followed by a newline.
@@ -335,16 +336,9 @@ public final class MixedTargetBuildDescription {
         // However, this module map should not expose the generated Swift
         // header since it will not exist yet.
         let unextendedModuleMapPath = intermediatesDirectory.appending(component: unextendedModuleMapFilename)
-        // Generating module maps that include non-Objective-C headers is not
-        // supported.
-        // FIXME(ncooke3): Link to evolution post.
-        // TODO(ncooke3): C++ headers can be ".h". How else can we rule them out?
-        let nonObjcHeaders: [AbsolutePath] = mixedTarget.clangTarget.headers
-            .filter { $0.extension != "h" }
         try moduleMapGenerator.generateModuleMap(
             type: .umbrellaDirectory(mixedTarget.clangTarget.path),
-            at: unextendedModuleMapPath,
-            excludeHeaders: nonObjcHeaders
+            at: unextendedModuleMapPath
         )
 
         // 3. Use VFS overlays to purposefully expose specific resources (e.g.

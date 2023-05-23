@@ -483,6 +483,7 @@ public final class SwiftTargetBuildDescription {
         result.append("-c")
         result.append(contentsOf: self.sources.map(\.pathString))
 
+        // jedi
         result.append("-I")
         result.append(self.buildParameters.buildPath.pathString)
 

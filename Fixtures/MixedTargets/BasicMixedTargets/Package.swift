@@ -143,6 +143,42 @@ let package = Package(
             ]
         ),
 
+        // MARK: - Experimental C++ Support
+        // TODO(ncooke3): Decide where to put `-enable-experimental-cxx-interop`
+        // within the implementation. Stub it out.
+
+        // First requirements:
+        // - Public Swift API
+        // - Private Swift API
+        // - Public C++ API
+        // - Private C++ API
+        // Second requirements:
+        // - Public Swift API
+        // - Private Swift API
+        // - Public C++ API
+        // - Private C++ API
+        .target(
+            name: "MixedTargetWithExperimentalCXX",
+            // TODO(ncooke3): Auto detect and move within the implementation.
+            swiftSettings: [.unsafeFlags(["-I", "Sources/MixedTargetWithExperimentalCXX", "-enable-experimental-cxx-interop"])]
+        ),
+
+        .target(
+            name: "SwiftTargetDependsOnMixedTargetWithCXX",
+            dependencies: ["MixedTargetWithExperimentalCXX"],
+            // TODO(ncooke3): Auto detect and move within the implementation.
+            // NOTE(ncooke3): Why do clients ned to pass this flag?
+            swiftSettings: [.unsafeFlags(["-enable-experimental-cxx-interop"])]
+        ),
+
+//        .target(
+//            name: "ClangTargetDependsOnMixedTargetWithCXX",
+//            dependencies: ["MixedTargetWithPublicCXXAPI"],
+//            swiftSettings: [.unsafeFlags([
+//                "-enable-experimental-cxx-interop"
+//            ])]
+//        ),
+
         // MARK: - MixedTargetWithC
         .target(
             name: "MixedTargetWithC"

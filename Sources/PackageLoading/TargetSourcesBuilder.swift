@@ -183,7 +183,7 @@ public struct TargetSourcesBuilder {
         // It's an error to contain mixed language source files.
         // FIXME(ncooke3): Update with next version of SPM.
         if sources.containsMixedLanguage, toolsVersion < .vNext  {
-            throw Target.Error.mixedSources(targetPath)
+//            throw Target.Error.mixedSources(targetPath)
         }
 
         return (sources, resources, headers, ignored, others)
